@@ -76,12 +76,25 @@ def _filter_code(frame: pd.DataFrame, code: str) -> pd.DataFrame:
     return frame[values.eq(code)].copy()
 
 
+def _normalize_holder_num(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    return frame.rename(columns={
+        "证券代码": "SECURITY_CODE",
+        "证券简称": "SECURITY_NAME_ABBR",
+        "变动日期": "END_DATE",
+        "本期股东人数": "HOLDER_NUM",
+        "上期股东人数": "PRE_HOLDER_NUM",
+        "股东人数增幅": "HOLDER_NUM_RATIO",
+    }).copy()
+
+
 def _ak_holder_num(code: str) -> pd.DataFrame:
     import akshare as ak
     for report_date in _quarter_dates():
         frame = _filter_code(ak.stock_hold_num_cninfo(date=report_date), code)
         if not frame.empty:
-            return frame
+            return _normalize_holder_num(frame)
     return pd.DataFrame()
 
 
@@ -298,7 +311,7 @@ def _security_name(frames: dict[str, pd.DataFrame]) -> str:
 
 def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
     frame_fetchers = {
-        "holder_num": (lambda: provider.holder_num_change(code), _ak_holder_num),
+        "holder_num": (lambda: provider.holder_num_change(code), lambda: _ak_holder_num(code)),
         "lockup": (lambda: provider.lockup_expiry(code), lambda: _ak_lockup(code)),
         "concepts": (lambda: provider.concept_blocks(code), None),
         "research": (lambda: provider.research_reports(code, max_pages=1), None),

@@ -82,6 +82,74 @@ def _financial_aliases(frame: pd.DataFrame) -> pd.DataFrame:
     return renamed
 
 
+THS_FINANCIAL_METRICS = {
+    "lrb": {
+        "operating_income_total": "营业总收入",
+        "operating_income": "营业收入",
+        "parent_holder_net_profit": "归属于母公司所有者的净利润",
+        "net_profit": "净利润",
+        "basic_eps": "基本每股收益",
+    },
+    "llb": {
+        "act_cash_flow_net": "经营活动产生的现金流量净额",
+        "invest_cash_flow_net": "投资活动产生的现金流量净额",
+        "financing_cash_flow_net": "筹资活动产生的现金流量净额",
+    },
+    "fzb": {
+        "cash": "货币资金",
+        "accounts_receivable": "应收账款",
+        "inventory": "存货",
+        "short_term_loans": "短期借款",
+        "year_non_current_debt": "一年内到期的非流动负债",
+        "long_term_loan": "长期借款",
+        "bonds_payable": "应付债券",
+        "lease_debt": "租赁负债",
+        "construction_process_total": "在建工程合计",
+        "construction_in_process": "在建工程",
+        "goodwill": "商誉",
+        "assets_total": "资产总计",
+        "total_debt": "负债合计",
+        "parent_holder_equity_total": "归属于母公司股东权益合计",
+    },
+}
+
+
+def _normalize_ths_financial_report(frame: pd.DataFrame, report_type: str) -> pd.DataFrame:
+    """Convert AKShare's THS long-form statements to the existing wide contract."""
+    metrics = THS_FINANCIAL_METRICS.get(report_type, {})
+    required = {"report_date", "metric_name", "value"}
+    if frame is None or frame.empty or not required.issubset(frame.columns) or not metrics:
+        return pd.DataFrame()
+    selected = frame[frame["metric_name"].isin(metrics)].copy()
+    if selected.empty:
+        return pd.DataFrame()
+    selected["report_date"] = pd.to_datetime(selected["report_date"], errors="coerce")
+    selected = selected.dropna(subset=["report_date"])
+    if selected.empty:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(index=sorted(selected["report_date"].unique(), reverse=True))
+    result.index.name = "报告期"
+    for metric, title in metrics.items():
+        rows = selected[selected["metric_name"].eq(metric)].drop_duplicates("report_date", keep="first")
+        if rows.empty:
+            continue
+        values = pd.to_numeric(rows.set_index("report_date")["value"], errors="coerce")
+        result[title] = values.reindex(result.index)
+        if "yoy" in rows.columns:
+            yoy = pd.to_numeric(rows.set_index("report_date")["yoy"], errors="coerce")
+            if yoy.notna().any():
+                result[f"{title}_同比"] = yoy.reindex(result.index)
+    result = result.reset_index()
+    result["报告期"] = result["报告期"].dt.strftime("%Y-%m-%d")
+    if "归属于母公司所有者的净利润" in result.columns:
+        result["归属于母公司的净利润"] = result["归属于母公司所有者的净利润"]
+        yoy_column = "归属于母公司所有者的净利润_同比"
+        if yoy_column in result.columns:
+            result["归属于母公司的净利润_同比"] = result[yoy_column]
+    return result
+
+
 # ══════════════════════════════════════════════════════
 #  Data Fetchers (each with fallback)
 # ══════════════════════════════════════════════════════
@@ -206,7 +274,7 @@ def fetch_company_and_peers(code: str) -> tuple[dict, pd.DataFrame]:
 
 
 def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
-    """财报: easy_tdx/Sina → AKShare/Sina，字段归一化后保持旧字段名。"""
+    """财报: easy_tdx/Sina → AKShare/Sina → AKShare/同花顺。"""
     indicator = {"lrb": "利润表", "fzb": "资产负债表", "llb": "现金流量表"}.get(report_type, report_type)
 
     def easy_sina() -> pd.DataFrame:
@@ -217,7 +285,23 @@ def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
         prefix = "sh" if code.startswith(("6", "9")) else "bj" if code.startswith(("4", "8")) else "sz"
         return _financial_aliases(ak.stock_financial_report_sina(stock=f"{prefix}{code}", symbol=indicator))
 
-    result = run_fallback_chain(f"财报/{report_type}", [("easy_tdx/Sina", easy_sina), ("AKShare/Sina", ak_sina)], seconds=15, empty=dataframe_empty)
+    def ak_ths() -> pd.DataFrame:
+        functions = {
+            "lrb": ak.stock_financial_benefit_new_ths,
+            "llb": ak.stock_financial_cash_new_ths,
+            "fzb": ak.stock_financial_debt_new_ths,
+        }
+        function = functions.get(report_type)
+        if function is None:
+            return pd.DataFrame()
+        return _normalize_ths_financial_report(function(symbol=code, indicator="按报告期"), report_type).head(8)
+
+    result = run_fallback_chain(
+        f"财报/{report_type}",
+        [("easy_tdx/Sina", easy_sina), ("AKShare/Sina", ak_sina), ("AKShare/同花顺", ak_ths)],
+        seconds=15,
+        empty=dataframe_empty,
+    )
     frame = result.value if isinstance(result.value, pd.DataFrame) else pd.DataFrame()
     if result.ok:
         print(f"  [财报/{report_type}] {result.source} → {len(frame)} 期")
@@ -469,7 +553,14 @@ def build_report(code: str, name: str,
     L.append("")
 
     # ── 3. 财务摘要 ──
-    L += ["## 3. 财务摘要", "", "*来源: easy_tdx/Sina*  ", ""]
+    financial_sources = []
+    for frame in financials.values():
+        for item in frame.attrs.get("source_chain", []):
+            source = str(item.get("source") or "")
+            if item.get("status") == "ok" and source and source not in financial_sources:
+                financial_sources.append(source)
+    source_text = " / ".join(financial_sources) if financial_sources else "需人工确认"
+    L += ["## 3. 财务摘要", "", f"*来源: {source_text}*  ", ""]
     financial_columns = {
         "利润表": ("lrb", ["报告期", "营业收入", "营业收入_同比", "归属于母公司的净利润", "归属于母公司的净利润_同比", "归属于母公司所有者的净利润", "归属于母公司所有者的净利润_同比", "基本每股收益"]),
         "资产负债表": ("fzb", ["报告期", "货币资金", "应收账款", "存货", "短期借款", "一年内到期的非流动负债", "长期借款", "应付债券", "租赁负债", "资产总计", "负债合计", "归属于母公司股东权益合计"]),

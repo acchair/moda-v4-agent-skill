@@ -49,13 +49,18 @@ def _normalize_irm_frame(frame: pd.DataFrame) -> pd.DataFrame:
     }).copy()
 
 
-def _fetch_cninfo_irm_http(code: str, timeout: int = 12) -> pd.DataFrame:
-    """Use CNINFO's public HTTP endpoints without browser state."""
+def _fetch_cninfo_irm_http(code: str, timeout: int = 12, scheme: str = "https") -> pd.DataFrame:
+    """Use CNINFO's public endpoints without browser state or credentials."""
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"不支持的互动易协议: {scheme}")
+    base_url = f"{scheme}://irm.cninfo.com.cn"
+    headers = {"User-Agent": "Mozilla/5.0"}
     org_response = requests.post(
-        "https://irm.cninfo.com.cn/newircs/index/queryKeyboardInfo",
+        f"{base_url}/newircs/index/queryKeyboardInfo",
         params={"_t": "1691144074"},
         data={"keyWord": code},
         timeout=timeout,
+        headers=headers,
     )
     org_response.raise_for_status()
     rows = (org_response.json().get("data") or [])
@@ -65,14 +70,14 @@ def _fetch_cninfo_irm_http(code: str, timeout: int = 12) -> pd.DataFrame:
         "_t": "1691142650", "stockcode": code, "orgId": rows[0]["secid"],
         "pageSize": "1000", "pageNum": "1", "keyWord": "", "startDay": "", "endDay": "",
     }
-    response = requests.post("https://irm.cninfo.com.cn/newircs/company/question", params=params, timeout=timeout)
+    response = requests.post(f"{base_url}/newircs/company/question", params=params, timeout=timeout, headers=headers)
     response.raise_for_status()
     payload = response.json()
     total_page = min(int(payload.get("totalPage") or 1), 10)
     frames = [pd.DataFrame(payload.get("rows") or [])]
     for page in range(2, total_page + 1):
         params["pageNum"] = str(page)
-        response = requests.post("https://irm.cninfo.com.cn/newircs/company/question", params=params, timeout=timeout)
+        response = requests.post(f"{base_url}/newircs/company/question", params=params, timeout=timeout, headers=headers)
         response.raise_for_status()
         frames.append(pd.DataFrame(response.json().get("rows") or []))
     return _normalize_irm_frame(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame())
@@ -107,12 +112,23 @@ def fetch_irm_qa(code: str, name: str = None) -> dict:
         print(f"  [互动易] {'无数据' if frame.empty else f'✅ 共 {len(frame)} 条问答'}")
         return _qa_payload(frame, fetch_state=state, source_chain=primary.source_chain or [])
     print(f"  [互动易] AKShare失败: {primary.error}")
-    fallback = run_with_timeout("互动易", lambda: _fetch_cninfo_irm_http(code), seconds=15, source="CNINFO/public HTTP")
+    fallback = run_with_timeout("互动易", lambda: _fetch_cninfo_irm_http(code, scheme="https"), seconds=15, source="CNINFO/public HTTPS")
     if fallback.ok:
         frame = fallback.value if isinstance(fallback.value, pd.DataFrame) else pd.DataFrame()
         state = "fallback_ok" if not frame.empty else "empty"
         return _qa_payload(frame, fetch_state=state, source_chain=(primary.source_chain or []) + (fallback.source_chain or []))
-    return _qa_payload(pd.DataFrame(), fetch_state="failed", source_chain=(primary.source_chain or []) + (fallback.source_chain or []), error=f"{primary.error}; fallback: {fallback.error}")
+    plain_http = run_with_timeout("互动易", lambda: _fetch_cninfo_irm_http(code, scheme="http"), seconds=15, source="CNINFO/public HTTP")
+    chain = (primary.source_chain or []) + (fallback.source_chain or []) + (plain_http.source_chain or [])
+    if plain_http.ok:
+        frame = plain_http.value if isinstance(plain_http.value, pd.DataFrame) else pd.DataFrame()
+        state = "fallback_ok" if not frame.empty else "empty"
+        return _qa_payload(frame, fetch_state=state, source_chain=chain)
+    return _qa_payload(
+        pd.DataFrame(),
+        fetch_state="failed",
+        source_chain=chain,
+        error=f"{primary.error}; HTTPS fallback: {fallback.error}; HTTP fallback: {plain_http.error}",
+    )
 
 
 def _normalize_announcement_frame(frame: pd.DataFrame) -> pd.DataFrame:
