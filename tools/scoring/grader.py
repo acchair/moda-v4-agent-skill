@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.scoring.evidence import REPORTS, REPORT_ROOT, SOURCE_LABELS, build_evidence, read_reports
+from tools.scoring.evidence import REPORTS, REPORT_ROOT, build_evidence, read_reports
 from tools.scoring.model import FactorResult, Scorecard, SubfactorResult, score_evidence
 
 
@@ -57,6 +57,38 @@ def _cashflow_summary(evidence: dict[str, Any]) -> str:
     return "经营现金流接近零"
 
 
+def _thesis_attitude(subfactors: dict[str, SubfactorResult], evidence: dict[str, Any]) -> tuple[str, str]:
+    """Keep the thesis label stricter than the scorecard's evidence coverage."""
+    peer_rows = evidence.get("peer_comparison")
+    verified_peers = [
+        row for row in peer_rows
+        if isinstance(row, dict) and row.get("status") == "已验证"
+    ] if isinstance(peer_rows, list) else []
+    checks = {
+        "公司兑现": subfactors["business_match"].status == "已验证" and subfactors["realization"].status == "已验证",
+        "直接同行比较": len(verified_peers) >= 2,
+        "市场预期差": subfactors["expectation_gap"].status == "已验证",
+        "反向验证": subfactors["financial_safety"].status == "已验证" and subfactors["survival_risk"].status == "已验证",
+    }
+    missing = [label for label, ready in checks.items() if not ready]
+    if not missing:
+        return "优选", "四项投资主张均有已验证证据支持。"
+    return "观察", "、".join(missing) + "仍需补证，不能把研究线索写成优选结论。"
+
+
+def _peer_comparison_note(evidence: dict[str, Any]) -> str:
+    peer_rows = evidence.get("peer_comparison")
+    verified_peers = [
+        row for row in peer_rows
+        if isinstance(row, dict) and row.get("status") == "已验证"
+    ] if isinstance(peer_rows, list) else []
+    if len(verified_peers) >= 2:
+        names = "、".join(str(row.get("name") or row.get("code") or "同行") for row in verified_peers[:3])
+        return f"已纳入{names}等直接同行的已验证经营质量对照；结论以收入、利润、现金流和产品壁垒的相对表现为准。"
+    peer_pe = _fmt_decimal(evidence.get("peer_pe_ttm_median"))
+    return f"当前只有宽口径同行估值中位数（PE约{peer_pe}），尚未取得至少两家直接同行的经营质量、客户或份额对照，不能据此证明公司一定优于同行。"
+
+
 def _progress_bar(value: float, maximum: float, width: int = 20) -> str:
     if width <= 0:
         return ""
@@ -78,6 +110,36 @@ def _factor_status(factor: FactorResult) -> str:
     if all(item.status == "需人工确认" for item in factor.subfactors):
         return "需人工确认"
     return "部分覆盖"
+
+
+def _status_icon(status: str) -> str:
+    if status in {"已验证", "通过", "未触发", "有效"}:
+        return "✅"
+    if status in {"部分覆盖", "网络命中（未核验）", "需人工确认"}:
+        return "🟡"
+    if status in {"搜索失败，需人工确认", "已搜索未命中", "不通过", "过期或缺失，不计分"}:
+        return "⚠️"
+    return "•"
+
+
+def _conclusion_icon(title: str) -> str:
+    for key, icon in (
+        ("投资主张", "🧭"),
+        ("为什么可能值得买", "✅"),
+        ("为什么不能直接买", "⏳"),
+        ("同行竞争", "⚖️"),
+        ("市场分歧", "🔍"),
+        ("行动评级", "🎯"),
+    ):
+        if key in title:
+            return icon
+    return "•"
+
+
+def _factor_icon(key: str) -> str:
+    return {
+        "F1": "🌐", "F2": "👥", "F3": "🛡️", "F4": "💰", "F5": "🔄", "F6": "📈",
+    }.get(key, "•")
 
 
 def _factor_summary(factor: FactorResult) -> str:
@@ -206,19 +268,24 @@ def _technical_snapshot(evidence: dict[str, Any]) -> str:
 
 
 def _moda_overview(card: Scorecard, evidence: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    subfactors = {item.key: item for factor in card.factors for item in factor.subfactors}
     chain_name = str(evidence.get("chain_name") or "产业链待确认")
     stage = _chain_stage_label(str(evidence.get("chain_stage") or ""))
     business_items = evidence.get("business_items") if isinstance(evidence.get("business_items"), list) else []
     business = "、".join(str(item) for item in business_items[:3]) or str(evidence.get("main_business") or "主营业务待确认")
     technical = _technical_snapshot(evidence)
+    attitude, attitude_reason = _thesis_attitude(subfactors, evidence)
+    peer_note = _peer_comparison_note(evidence)
+    price = subfactors["price_position"]
+    valuation = subfactors["valuation"]
+    inflection = subfactors["inflection"]
     return [
-        ("产业与业务", "行业景气：" + str(evidence.get("industry_prosperity_status", "需人工确认")),
-         f"对应{chain_name}{stage}", f"主营包括{business}，产业链具体增速、供需和资本开支仍需补证。"),
-        ("公司卡位", f"{stage}业务映射", f"主营映射至{chain_name}{stage}", "主营与产业链已有映射，竞争份额、客户壁垒和国产替代程度仍以可核验证据为准。"),
-        ("利润兑现", "财务兑现进度", f"营收同比{_fmt_pct(evidence.get('revenue_yoy'))}，利润同比{_fmt_pct(evidence.get('profit_yoy'))}", f"{_cashflow_summary(evidence)}，订单、利润和现金回收能否同步改善仍需跟踪。"),
-        ("位置与态度", f"三年价格分位{_fmt_pct(evidence.get('price_percentile_3y'))}", f"个股关注度{_fmt_pct(evidence.get('attention_heat'))}，行业拥挤度{_fmt_pct(evidence.get('market_congestion'))}", technical),
-        ("安全边际", "财务安全垫偏薄", "没有发现ST或重大审计风险", "负债和短债压力仍需持续观察，低位不能替代现金流改善。"),
-        ("交易修正", str(evidence.get("technical_signal") or "需人工确认"), f"技术信号：{evidence.get('technical_signal', '需人工确认')}", f"{technical}，交易判断以当前技术证据为准。"),
+        ("投资主张", f"主张态度：{attitude}", f"正式行动评级：{card.action_rating}", attitude_reason),
+        ("为什么可能值得买", f"{stage}业务映射", f"主营包括{business}", f"行业景气为{evidence.get('industry_prosperity_status', '需人工确认')}；营收同比{_fmt_pct(evidence.get('revenue_yoy'))}、利润同比{_fmt_pct(evidence.get('profit_yoy'))}，{_cashflow_summary(evidence)}。"),
+        ("为什么不能直接买", f"三年价格分位{_fmt_pct(evidence.get('price_percentile_3y'))}", f"TTM PE {_fmt_decimal(evidence.get('pe_ttm'))}、PB {_fmt_decimal(evidence.get('pb'))}", f"{price.reason}；{valuation.reason}；{technical}。"),
+        ("同行竞争", "直接同行对照", "为什么是它：需人工确认" if "直接同行比较" in attitude_reason else "直接同行对照已验证", peer_note),
+        ("市场分歧", f"业绩拐点：{inflection.status}", "市场可能低估持续兑现，也可能高估短期改善", f"{inflection.reason}；后续看订单、营收、利润和经营现金流是否连续改善。"),
+        ("行动评级", f"研究分 {_fmt(card.research_score)}/100", f"正式行动评级：{card.action_rating}", f"{card.action_rating_reason}；投资主张态度不单独改变正式评级。"),
     ]
 
 
@@ -249,15 +316,10 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[tup
     factors = {factor.key: factor for factor in card.factors}
     adjustments = {item.key: item for item in card.adjustments}
     name = str(evidence.get("name") or evidence.get("code") or "该标的")
-    realization = subfactors["realization"]
     price = subfactors["price_position"]
     valuation = subfactors["valuation"]
-    coldness = subfactors["coldness"]
     inflection = subfactors["inflection"]
     financial = subfactors["financial_safety"]
-    background = subfactors["background"]
-    technical = adjustments["technical_structure"]
-    sentiment = adjustments["sentiment"]
     chain_name = str(evidence.get("chain_name") or "产业链待确认")
     stage = _chain_stage_label(str(evidence.get("chain_stage") or evidence.get("chain_position") or ""))
     match_type = str(evidence.get("chain_match_type") or "匹配类型待确认")
@@ -282,13 +344,15 @@ def _framework_conclusion(card: Scorecard, evidence: dict[str, Any]) -> list[tup
     congestion = _fmt_pct(evidence.get("market_congestion"))
     cashflow = _cashflow_summary(evidence)
     technical_snapshot = _technical_snapshot(evidence)
+    thesis_attitude, thesis_reason = _thesis_attitude(subfactors, evidence)
+    peer_note = _peer_comparison_note(evidence)
     return [
-        ("1. 一句话逻辑", f"{name}当前行动状态为“{card.action_rating}”。公司对应{chain_name}{stage}，主营业务集中在{product_note}；行业景气为{prosperity}，收入同比{revenue_yoy}、归母净利润同比{profit_yoy}，{cashflow}。订单、利润和现金回收是否形成稳定改善，仍需结合后续报告期验证。"),
-        ("2. 产业与业务位置", f"{name}主营业务为{main_business}，当前归入{chain_name}{stage}，产业链匹配方式为{match_type}。现有证据仅确认以上业务和链位映射；未来需求增速、供需缺口、资本开支与竞争份额仍需补证，国产替代仅在有对应证据时成立。"),
-        ("3. 国产替代与利润兑现", f"现有主营和收入结构显示{product_note}。近一期订单增长指标为{order_growth}，营收同比{revenue_yoy}、利润同比{profit_yoy}，海外收入占比约{overseas_ratio}，{cashflow}；订单、收入、毛利和现金回收能否同步改善仍需持续验证。"),
-        ("4. 位置与市场态度", f"当前价格为{latest_price}元，三年价格分位约{price_percentile}；估值方面TTM PE为{pe_ttm}、PB为{pb}，低位不等于便宜或已经反转。个股关注度为{attention_heat}，所属行业拥挤度为{congestion}，技术面出现{evidence.get('technical_signal', '需人工确认')}信号；{technical_snapshot}。"),
-        ("5. 安全边际", f"公司未见ST、退市或重大审计风险，近180天也未核验到控股股东减持；但{financial.reason}。股东层面相对稳定，财务层面的安全垫仍偏薄，若经营现金流继续为负或短债压力上升，低估值和低股价不能抵消基本面风险。"),
-        ("6. 评级与证伪条件", f"研究分为{_fmt(card.research_score)}/100，证据覆盖率为{card.coverage:.1%}；按研究分映射为买入/持有/卖出，本次行动评级为“{card.action_rating}”。覆盖率仅提示证据质量，不新增第四种评级。后续需要看到订单、营收、利润和经营现金流连续两个报告期改善，且行业需求和资本开支不再走弱；若出现现金流持续恶化、非标审计、重大持续经营风险或控股股东减持，应直接证伪当前观察逻辑。"),
+        ("1. 投资主张", f"{name}当前正式行动评级为“{card.action_rating}”，投资主张态度为“{thesis_attitude}”。公司处于{chain_name}{stage}，主营集中在{product_note}；行业景气为{prosperity}，营收同比{revenue_yoy}、利润同比{profit_yoy}，{cashflow}。{thesis_reason}"),
+        ("2. 为什么可能值得买", f"可研究的逻辑不是概念标签，而是公司在{chain_name}{stage}提供{main_business}。现有收入结构为{product_note}；订单增长指标为{order_growth}，海外收入占比约{overseas_ratio}。若订单、收入、毛利和现金回收连续改善，才说明产业位置开始转化为利润兑现。"),
+        ("3. 为什么不能直接买", f"当前位置需要先过价格和估值两关：当前价格为{latest_price}元，三年价格分位约{price_percentile}；TTM PE为{pe_ttm}、PB为{pb}。{price.reason}；{valuation.reason}。个股关注度为{attention_heat}，所属行业拥挤度为{congestion}，技术面为{evidence.get('technical_signal', '需人工确认')}；{technical_snapshot}。"),
+        ("4. 同行竞争与为什么是它", f"{peer_note} 公司当前仅确认主营与{chain_name}{stage}的映射，匹配方式为{match_type}；竞争份额、核心客户、认证周期和国产替代程度仍需以年报、公告或结构化同业数据验证。"),
+        ("5. 市场分歧与验证", f"可验证的预期差来自业绩是否持续改善，而不是单次上涨或热门概念。当前业绩拐点判断为“{inflection.status}”：{inflection.reason}。市场可能低估的是收入、利润和现金流同步改善的持续性；市场可能高估的是增长已经无风险兑现。后续优先观察订单、营收、利润和经营现金流能否连续两个报告期同向改善。"),
+        ("6. 行动评级与证伪条件", f"研究分为{_fmt(card.research_score)}/100，证据覆盖率为{card.coverage:.1%}；本次正式行动评级为“{card.action_rating}”，不因投资主张态度单独上调或下调。公司未见ST、退市或重大审计风险，近180天也未核验到控股股东减持；但{financial.reason}。若现金流持续恶化、营收与利润同步转弱、出现非标审计或重大持续经营风险、控股股东减持，或直接同行的经营质量持续领先，应直接证伪当前观察逻辑。"),
     ]
 
 
@@ -324,7 +388,7 @@ def _technical_analysis(evidence: dict[str, Any]) -> list[str]:
     structure_score = evidence.get("technical_structure_score", "需人工确认")
     structure_reason = evidence.get("technical_structure_reason", "技术证据不足，需人工确认")
     lines = [
-        "## 技术分析（easy-tdx 日 K）",
+        "## 技术分析（easy-tdx 日 K） 📈",
         "",
         (
             f"- 当前价格：{current_price}；支撑位：{support}；压力位：{resistance}。"
@@ -359,7 +423,7 @@ def _industry_prosperity_analysis(evidence: dict[str, Any]) -> list[str]:
         except (TypeError, ValueError):
             return "需人工确认"
     return [
-        "## 行业景气度交叉验证",
+        "## 行业景气度交叉验证 🌐",
         "",
         f"- 行业映射：{mapping.get('matched_token', '需人工确认')} → {mapping.get('sw_second_name', '需人工确认')} → {mapping.get('sw_first_name', '需人工确认')}（{mapping.get('status', '不可用')}）",
         f"- 综合状态：{evidence.get('industry_prosperity_status', '不可用')}；覆盖：{evidence.get('industry_prosperity_coverage', '不可用')}；报告期：{evidence.get('industry_prosperity_period', '需人工确认')}。本项只交叉验证，不独立加分。",
@@ -381,41 +445,23 @@ def _industry_prosperity_analysis(evidence: dict[str, Any]) -> list[str]:
 
 
 def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecard, requested_modules: tuple[str, ...]) -> str:
-    adjustments = {item.key: item for item in card.adjustments}
     lines = [
         f"# {name or code}（{code}）六层诊断",
         "",
         f"<!-- moda_scorecard: {json.dumps(card.to_dict(), ensure_ascii=False)} -->",
         "",
-        "## 研究评分",
+        "## 研究评分 📊",
         "",
         "```text",
         f"  {_fmt(card.research_score)} / 100  [{_progress_bar(card.research_score, 100)}]",
         f"  行动评级：{card.action_rating}",
-        (
-            f"  F6修正：机构方向 {adjustments['institutional_direction'].score:g}/2  |  "
-            f"技术结构 {adjustments['technical_structure'].score:g}/4  |  "
-            f"情绪/拥挤度 {adjustments['sentiment'].score:g}/2  |  "
-            f"风口催化 {adjustments['catalyst'].score:g}/2"
-        ),
         "```",
         "",
-        f"### 技术信号：{card.signal}",
+        f"### 技术信号：{_status_icon(card.signal)} {card.signal}",
         "",
-        "## 证据覆盖与行动状态",
+        "## 一句话结论与最终判断 🧭",
         "",
-        "| 指标 | 当前值 | 含义 |",
-        "|---|---:|---|",
-        f"| 研究分 | {_fmt(card.research_score)}/100 | 在已知证据范围内归一化，用于研究排序 |",
-        f"| 证据覆盖率 | {card.coverage:.1%} | 已覆盖评分项 / 全部评分项 |",
-        f"| 已确认得分 | {_fmt(card.verified_points)} | 结构化或明确来源证据支持 |",
-        f"| 未核验得分 | {_fmt(card.provisional_points)} | 网络线索或部分覆盖证据支持 |",
-        f"| 未知可得分上限 | {_fmt(card.unknown_maximum)} | 尚未核验，不加分也不扣分 |",
-        f"| 行动评级 | {card.action_rating} | {card.action_rating_reason} |",
-        "",
-        "## 一句话结论与最终判断",
-        "",
-        "### 莫大视角总览",
+        "### 投资判断总览 🧠",
         "",
         "| 核心问题 | 图示 | 大白话结论 | 数据与理由 |",
         "|---|---|---|---|",
@@ -424,11 +470,11 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
         lines.append(f"| {topic} | `{chart}` | {_table_text(plain)} | {_table_text(reason)} |")
     lines += [""]
     for title, body in _framework_conclusion(card, evidence):
-        lines += [f"**{title}**", "", body, ""]
+        lines += [f"**{title}**", "", f"> {_conclusion_icon(title)} {body}", "", "---", ""]
     chain_name = str(evidence.get("chain_name") or "未识别产业链")
     stage = _chain_stage_label(str(evidence.get("chain_stage") or evidence.get("chain_position") or ""))
     lines += [
-        "### 核心上下游对应表",
+        "### 核心上下游对应表 🔗",
         "",
         f"> 产业链：{chain_name}；公司位置：{stage}；匹配类型：{evidence.get('chain_match_type', '待确认')}。表内上下游来自产业链资料库，公司与具体供应商、客户的关系仍以公告和年报为准。",
         "",
@@ -443,7 +489,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
     lines.extend(_industry_prosperity_analysis(evidence))
     lines += [
         "",
-        "## 六层图形概览",
+        "## 六层图形概览 🧩",
         "",
         "```text",
     ]
@@ -455,7 +501,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
     lines += [
         "```",
         "",
-        "## 六层评分卡",
+        "## 六层评分卡 🧮",
         "",
         "| 因子 | 得分 | 核心判断 | 状态 |",
         "|---|---:|---|---|",
@@ -466,7 +512,7 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
     for factor in card.factors:
         lines += [
             "",
-            f"## {factor.key} {factor.label}（{_fmt(factor.score)}/{_fmt(factor.maximum)}）",
+            f"## {factor.key} {factor.label}（{_fmt(factor.score)}/{_fmt(factor.maximum)}） {_factor_icon(factor.key)}",
         ]
         if factor.key == "F6":
             lines += [
@@ -486,12 +532,14 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
 
     lines += [
         "",
-        "## 舆情、社交热榜与异常推广风险",
+        "## 舆情、社交热榜与异常推广风险 🔍",
         "",
         f"- 个股关注热度：{evidence.get('attention_heat', '需人工确认')}（EastMoney 人气排名归一化）",
         f"- 市场拥挤度：{evidence.get('market_congestion', '需人工确认')}；申万二级 {evidence.get('market_congestion_industry', '需人工确认')}（{evidence.get('market_congestion_industry_code', '需人工确认')}）；行业强度 {evidence.get('market_congestion_strength', '需人工确认')}；今日检查 {evidence.get('market_congestion_checked_date', '需人工确认')}；源数据日期 {evidence.get('market_congestion_date', '需人工确认')}；{'有效' if evidence.get('market_congestion_fresh') is True else '过期或缺失，不计分'}",
-        f"- 社交热榜：命中 {evidence.get('social_hot_hits', '需人工确认')} 条，覆盖 {evidence.get('social_platform_hits', '需人工确认')} 个平台",
-        f"- 个股讨论：{evidence.get('discussion_posts_total', '需人工确认')} 条；来源 {evidence.get('discussion_source_status', '需人工确认')}；情绪 {evidence.get('discussion_sentiment', '需人工确认')}；推广话术 {('、'.join(evidence.get('discussion_promotion_hits', [])) or '无') if isinstance(evidence.get('discussion_promotion_hits'), list) else '需人工确认'}",
+        f"- 社交热榜：命中 {evidence.get('social_hot_hits', '需人工确认')} 条，去重后 {evidence.get('social_unique_topics', '需人工确认')} 个主题，覆盖 {evidence.get('social_platform_hits', '需人工确认')} 个平台；跨平台主题 {evidence.get('social_cross_platform_topics', '需人工确认')} 个",
+        f"- 传播速度：{evidence.get('social_propagation_status', '需人工确认')}；24小时新主题 {evidence.get('social_new_topics_24h', '需人工确认')}；快速扩散主题 {evidence.get('social_fast_spread_topics', '需人工确认')}；最大排名跃升 {evidence.get('social_rank_jump_max') if evidence.get('social_rank_jump_max') is not None else '需更多快照'}",
+        f"- 个股讨论：{evidence.get('discussion_posts_total', '需人工确认')} 条；样本 {evidence.get('discussion_sample_status', '需人工确认')}；来源 {evidence.get('discussion_source_status', '需人工确认')}；情绪 {evidence.get('discussion_sentiment', '样本不足，需人工确认')}；推广话术 {('、'.join(evidence.get('discussion_promotion_hits', [])) or '无') if isinstance(evidence.get('discussion_promotion_hits'), list) else '需人工确认'}",
+        f"- 新闻舆情：{evidence.get('news_posts_total', '需人工确认')} 条；来源 {evidence.get('news_sources_ok', '需人工确认')}/{evidence.get('news_sources_checked', '需人工确认')}；情绪 {evidence.get('news_sentiment', '需人工确认')}。新闻只作事件和舆情补充，不并入社交热度。",
         f"- 异常推广风险：{evidence.get('trap_risk_level', '需人工确认')}；命中 {evidence.get('trap_signal_count', '需人工确认')}/8",
         "",
         "| 异常推广信号 | 结果 | 证据 |",
@@ -504,70 +552,29 @@ def render_report(code: str, name: str, evidence: dict[str, Any], card: Scorecar
 
     lines += [
         "",
-        "## Hard Cap 检查",
+        "## Hard Cap 检查 🛡️",
         "",
         "| 条件 | 本次结果 | 对评级的影响 |",
         "|---|---|---|",
     ]
     for item in card.hard_caps:
-        lines.append(f"| {item['condition']} | {item['result']} | {_visible_action_cap(item['cap'])} |")
+        result = f"{_status_icon(item['result'])} {item['result']}"
+        lines.append(f"| {item['condition']} | {result} | {_visible_action_cap(item['cap'])} |")
 
-    lines += ["", "## 睡得着检查", ""]
+    lines += ["", "## 睡得着检查 😴", ""]
     for label, status, reason in _sleep_checks(card):
-        lines.append(f"- {label}：{status}。{reason}")
+        lines.append(f"- {_status_icon(status)} {label}：{status}。{reason}")
 
     lines += [
         "",
-        "## 动态纠错触发器",
+        "## 动态纠错触发器 🔄",
         "",
         "- 产业证伪：行业需求、供需方向、订单或下游资本开支连续两个报告期恶化。",
         "- 公司证伪：营收与利润同时转负、经营现金流持续为负，或出现非标审计和重大持续经营风险。",
         "- 估值过热：三年价格分位超过 80%，且市场拥挤度达到 80% 以上；或 TTM PE 超过同行中位数 50%。",
         "- 股东恶化：控股股东或实控人减持、质押比例明显上升，或未来半年解禁比例超过 10%。",
         "- 同链高切低：同产业链出现 F1/F3 不弱、但 F5 得分高出 4 分以上的标的时重新比较。",
-        "",
-        "## 数据覆盖与待确认",
-        "",
     ]
-    completed = evidence.get("completed_modules", [])
-    missing = [module for module in requested_modules if module not in completed]
-    source_names = [f"{module} [{SOURCE_LABELS.get(module, module)}]" for module in completed]
-    lines.append("- 已完成模块：" + ("、".join(source_names) if source_names else "无"))
-    lines.append("- 失败或缺失模块：" + ("、".join(missing) if missing else "无"))
-    missing_items = [item.label for factor in card.factors for item in factor.subfactors if item.status in {"需人工确认", "搜索失败，需人工确认"}]
-    lines.append("- 需人工确认：" + ("、".join(dict.fromkeys(missing_items)) if missing_items else "无"))
-    pending_rows = _pending_confirmation_rows(card)
-    if pending_rows:
-        lines += [
-            "",
-            "### 待补证明细",
-            "",
-            "> “需人工确认”表示证据尚未达到自动确认标准，不等于利空，也不会把未知项当成负面事实。",
-            "",
-            "| 项目 | 当前状态 | 为什么不能直接判断 | 需要补充的证据 |",
-            "|---|---|---|---|",
-        ]
-        for label, status, why, guidance in pending_rows:
-            lines.append(f"| {label} | {status} | {_table_text(why)} | {_table_text(guidance, 180)} |")
-    web_hits = [item.label for factor in card.factors for item in factor.subfactors if item.status == "网络命中（未核验）"]
-    no_hits = [item.label for factor in card.factors for item in factor.subfactors if item.status == "已搜索未命中"]
-    lines.append("- 网络命中但未核验：" + ("、".join(dict.fromkeys(web_hits)) if web_hits else "无"))
-    lines.append("- 已搜索未命中：" + ("、".join(dict.fromkeys(no_hits)) if no_hits else "无"))
-    confirmed_deductions = [
-        f"{item.label}：{_fmt(item.maximum - item.score)} 分"
-        for factor in card.factors
-        for item in factor.subfactors
-        if item.status == "已验证" and item.score < item.maximum
-    ]
-    lines.append("- 已确认扣分：" + ("、".join(confirmed_deductions) if confirmed_deductions else "无"))
-    unknown_items = [
-        f"{item.label}（最多 {_fmt(item.unknown_maximum)} 分）"
-        for factor in card.factors
-        for item in factor.subfactors
-        if item.unknown_maximum > 0
-    ]
-    lines.append("- 未知项：" + ("、".join(unknown_items) if unknown_items else "无"))
-
     lines += ["", "免责声明：本分析仅供研究参考，不构成投资建议。"]
     return "\n".join(lines) + "\n"
 

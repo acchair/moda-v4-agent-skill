@@ -1,10 +1,11 @@
-akshare==1.18.37
-beautifulsoup4==4.14.3
-easy-tdx==1.19.0
-efinance==0.5.8
+akshare==1.18.83
+beautifulsoup4==4.15.0
+easy-tdx==1.20.6
+efinance==0.5.9
 numpy==2.4.3
 pandas==2.3.3
-pypdf==6.1.1
-requests==2.32.5
+pypdf==6.15.0
+requests==2.34.2
 PyYAML==6.0.3
 ta==0.11.0
+yfinance==1.5.2

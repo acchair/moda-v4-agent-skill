@@ -32,6 +32,12 @@ from tools.scoring.search_rules import RULES, evaluate as evaluate_gap, queries_
 
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "web_research"
 USER_AGENT = "moda-v4-research/1.0"
+PUBLIC_SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+)
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
 MAX_FETCH_BYTES = 600_000
 MAX_PDF_FETCH_BYTES = 10_000_000
 MAX_PAGES = 30
@@ -127,7 +133,10 @@ def _load_local_env() -> None:
     path = ROOT / ".env"
     if not path.exists():
         return
-    allowed = {"MODA_SEARCH_PROVIDER", "SEARXNG_URL", "DDG_MCP_URL"}
+    allowed = {
+        "MODA_SEARCH_PROVIDER", "SEARXNG_URL", "DDG_MCP_URL",
+        "DDG_HTML_URL", "DDG_LITE_URL",
+    }
     for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -347,9 +356,9 @@ def _ddg_mcp_search(url: str, query: str, timeout: float) -> list[dict[str, Any]
 def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
     """Use DuckDuckGo's public HTML endpoint when no local service exists."""
     response = _http_session().get(
-        "https://html.duckduckgo.com/html/",
+        os.getenv("DDG_HTML_URL", DDG_HTML_URL).strip() or DDG_HTML_URL,
         params={"q": query, "kl": "cn-zh"},
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+        headers={"User-Agent": PUBLIC_SEARCH_USER_AGENT, "Accept": "text/html"},
         timeout=timeout,
     )
     response.raise_for_status()
@@ -366,6 +375,37 @@ def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
         if not href.startswith(("http://", "https://")):
             continue
         rows.append({"title": title, "url": href, "snippet": "", "date": "", "engine": "DuckDuckGo HTML"})
+        if len(rows) >= 8:
+            break
+    return _prioritize_search_rows(rows)
+
+
+def _duckduckgo_lite_search(query: str, timeout: float) -> list[dict[str, Any]]:
+    """Use DuckDuckGo Lite, which is less JavaScript- and bandwidth-dependent."""
+    response = _http_session().get(
+        os.getenv("DDG_LITE_URL", DDG_LITE_URL).strip() or DDG_LITE_URL,
+        params={"q": query, "kl": "cn-zh"},
+        headers={"User-Agent": PUBLIC_SEARCH_USER_AGENT, "Accept": "text/html"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    pattern = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.I | re.S)
+    rows: list[dict[str, Any]] = []
+    for attrs, title_html in pattern.findall(response.text):
+        class_match = re.search(r'class=["\'][^"\']*\bresult-link\b[^"\']*["\']', attrs, re.I)
+        href_match = re.search(r'href=["\']([^"\']+)["\']', attrs, re.I)
+        if not class_match or not href_match:
+            continue
+        href = href_match.group(1)
+        title = re.sub(r"<[^>]+>", " ", title_html)
+        title = re.sub(r"\s+", " ", title).strip()
+        parsed = urlparse(urljoin("https://lite.duckduckgo.com/lite/", href))
+        if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+            href = parse_qs(parsed.query).get("uddg", [""])[0] or href
+        href = urljoin("https://lite.duckduckgo.com/lite/", href)
+        if not href.startswith(("http://", "https://")):
+            continue
+        rows.append({"title": title, "url": href, "snippet": "", "date": "", "engine": "DuckDuckGo Lite"})
         if len(rows) >= 8:
             break
     return _prioritize_search_rows(rows)
@@ -413,6 +453,15 @@ def _search(provider: str, query: str, timeout: float, cache_scope: str = "") ->
             errors.append("duckduckgo_html:no_results")
         except Exception as exc:
             errors.append(f"duckduckgo_html:{type(exc).__name__}")
+        try:
+            rows = _duckduckgo_lite_search(query, timeout)
+            if rows:
+                if cache_key:
+                    _save_search_cache(cache_key, "duckduckgo_lite", rows)
+                return "duckduckgo_lite", rows, errors
+            errors.append("duckduckgo_lite:no_results")
+        except Exception as exc:
+            errors.append(f"duckduckgo_lite:{type(exc).__name__}")
     if not searxng and not ddg and not errors:
         errors.append("search_backend_not_configured")
     return "none", [], errors

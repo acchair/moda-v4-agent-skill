@@ -19,7 +19,7 @@ from tools.scoring.classification_db import (
 ROOT = Path(__file__).resolve().parents[2]
 REPORT_ROOT = ROOT / "knowledge" / "research"
 SOURCE_LABELS = {
-    "finance_data": "easy_tdx/TDX + easy_tdx/Sina",
+    "finance_data": "easy_tdx/TDX + easy_tdx/Sina + efinance/AKShare/Tencent",
     "business_data": "EastMoney/F10",
     "tdx_analysis": "easy_tdx/TDX",
     "announcements": "easy_tdx/CNINFO + AKShare/CNINFO",
@@ -27,7 +27,7 @@ SOURCE_LABELS = {
     "popularity": "EastMoney/stockrank",
     "supply_demand": "AKShare/futures",
     "congestion": "乐咕乐股/申万二级行业拥挤度",
-    "social_sentiment": "公开社交热榜 + 个股讨论接口/搜索",
+    "social_sentiment": "公开社交热榜 + 个股讨论接口/搜索 + 财经快讯",
     "macro_policy": "AKShare/PBOC + gov.cn",
     "web_research": "SearXNG + DuckDuckGo MCP",
     "industry_prosperity": "乐咕乐股(B级) + AKShare/申万",
@@ -767,6 +767,16 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
         int(_float(evidence.get("social_platform_hits")) or 0),
         int(_float(evidence.get("discussion_source_count")) or 0),
     )
+    promotion_record_count = int(_float(evidence.get("discussion_promotion_record_count")) or 0)
+    promotion_source_count = int(_float(evidence.get("discussion_promotion_source_count")) or 0)
+    promotion_platforms = {str(item) for item in evidence.get("social_promotional_platforms", []) if item}
+    author_count = int(_float(evidence.get("discussion_author_count")) or 0)
+    template_clusters = int(_float(evidence.get("discussion_template_cluster_count")) or 0)
+    synchronized_recommendation = promotion_record_count >= 3 and (author_count >= 3 or promotion_source_count >= 2)
+    template_hit = template_clusters >= 1 or (
+        promotion_record_count >= 2 and len(promotion_hits & set(PROMOTION_TEMPLATE_TERMS)) >= 2
+    )
+    cross_platform_promotion = len(promotion_platforms) >= 3
     attention = _float(evidence.get("attention_heat"))
     social_heat = _float(evidence.get("social_heat"))
     combined_heat = max(value for value in (attention, social_heat) if value is not None) if any(value is not None for value in (attention, social_heat)) else None
@@ -787,17 +797,26 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     if combined_heat is not None and price is not None:
         kline_reason = f"热度 {combined_heat:.2f}、价格分位 {price:.1%}、技术过热={evidence.get('technical_overheat')}"
     checks = [
-        {"signal": "大量账号/平台同步推荐", "hit": platform_hits >= 3, "evidence": f"热榜命中 {platform_hits} 个平台" if platform_hits else "当前热榜未形成跨平台命中"},
-        {"signal": "推荐话术模板化", "hit": len(promotion_hits & set(PROMOTION_TEMPLATE_TERMS)) >= 2, "evidence": "、".join(sorted(promotion_hits & set(PROMOTION_TEMPLATE_TERMS))) or "未命中两类模板话术"},
+        {"signal": "大量账号/平台同步推荐", "hit": synchronized_recommendation, "evidence": f"推广内容 {promotion_record_count} 条、作者 {author_count} 个、来源 {promotion_source_count} 个" if promotion_record_count else "未取得多作者或多来源同步推荐证据"},
+        {"signal": "推荐话术模板化", "hit": template_hit, "evidence": f"模板簇 {template_clusters} 个；话术 {'、'.join(sorted(promotion_hits & set(PROMOTION_TEMPLATE_TERMS))) or '无'}"},
         {"signal": "付费社群/VIP 引流", "hit": bool(promotion_hits & set(PAID_GROUP_TERMS)), "evidence": "、".join(sorted(promotion_hits & set(PAID_GROUP_TERMS))) or "未命中付费引流词"},
         {"signal": "基本面与热度脱节", "hit": fundamental_gap, "evidence": fundamental_reason},
         {"signal": "K 线异常配合", "hit": kline_overlap, "evidence": kline_reason},
         {"signal": "老师/股神人设推广", "hit": bool(promotion_hits & set(PERSONA_TERMS)), "evidence": "、".join(sorted(promotion_hits & set(PERSONA_TERMS))) or "未命中人设推广词"},
-        {"signal": "跨平台联动推广", "hit": platform_hits >= 3 and bool(promotion_hits), "evidence": f"{platform_hits} 个平台且出现推广词" if platform_hits else "未形成跨平台推广证据"},
+        {"signal": "跨平台联动推广", "hit": cross_platform_promotion, "evidence": "、".join(sorted(promotion_platforms)) if promotion_platforms else "未形成至少三个推广平台证据"},
         {"signal": "虚假研报/谣言/澄清", "hit": bool(rumor_hits or announcement_rumors), "evidence": "、".join(sorted(rumor_hits | announcement_rumors)) or "未命中公开谣言或澄清证据"},
     ]
     signal_count = sum(bool(item["hit"]) for item in checks)
-    independent_categories = sum((bool(platform_hits or promotion_hits), any(value is not None for value in (profit, profit_yoy, revenue_yoy, price)), bool(announcement_rumors)))
+    social_abnormality = any((synchronized_recommendation, template_hit, bool(promotion_hits & set(PAID_GROUP_TERMS)), bool(promotion_hits & set(PERSONA_TERMS)), cross_platform_promotion, bool(rumor_hits)))
+    market_abnormality = fundamental_gap or kline_overlap
+    official_abnormality = bool(announcement_rumors)
+    independent_categories = sum((social_abnormality, market_abnormality, official_abnormality))
+    coverage_partial = any((
+        evidence.get("social_partial") is True,
+        evidence.get("discussion_partial") is True,
+        evidence.get("news_partial") is True,
+        int(_float(evidence.get("social_platforms_checked")) or 0) < int(_float(evidence.get("social_platforms_total")) or 0),
+    ))
     if evidence.get("social_platforms_checked") is not None or evidence.get("discussion_source_status"):
         _set(evidence, "trap_signal_count", signal_count, SOURCE_LABELS["social_sentiment"])
         _set(evidence, "trap_checks", checks, SOURCE_LABELS["social_sentiment"])
@@ -806,7 +825,7 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
             risk = "高"
         elif signal_count >= 2:
             risk = "注意"
-        elif int(_float(evidence.get("social_platforms_checked")) or 0) < int(_float(evidence.get("social_platforms_total")) or 0):
+        elif coverage_partial:
             risk = "未见高风险信号（部分覆盖）"
         else:
             risk = "低"

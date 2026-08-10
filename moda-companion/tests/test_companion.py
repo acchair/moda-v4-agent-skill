@@ -173,5 +173,21 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual(marker.read_text(encoding="utf-8"), "original")
 
 
+class SkillContractTest(unittest.TestCase):
+    def test_method_framework_keeps_authoritative_rating_boundary(self) -> None:
+        method_text = (ROOT / "references" / "method.md").read_text(encoding="utf-8")
+        for expected in ("五类机会模型", "五问过滤器", "A 已坐实", "三级信息不能成为投资理由"):
+            self.assertIn(expected, method_text)
+        for expected in ("research_score", "action_rating", "不能重算、覆盖或绕开评分"):
+            self.assertIn(expected, method_text)
+
+    def test_skill_routes_user_examples_without_creating_second_rating(self) -> None:
+        skill_text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        for expected in ("莫大会怎么看这个股票", "这个行业符合莫大审美吗", "按照莫大逻辑选股"):
+            self.assertIn(expected, skill_text)
+        self.assertIn("不是第二套评分模型", skill_text)
+        self.assertIn("最终行动名称仍以 moda-v4 的 `action_rating` 为准", skill_text)
+
+
 if __name__ == "__main__":
     unittest.main()

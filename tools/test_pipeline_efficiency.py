@@ -124,7 +124,9 @@ class PipelineEfficiencyTest(unittest.TestCase):
              patch.object(stock_discussion, "_search_fallback", side_effect=AssertionError("must not search")):
             data = stock_discussion.collect("300684", "中石科技")
         self.assertEqual(data["discussion_structured_count"], 1)
-        self.assertEqual(data["discussion_source_status"], "结构化接口")
+        self.assertEqual(data["discussion_source_status"], "结构化接口（部分覆盖）")
+        self.assertEqual(data["discussion_sample_status"], "样本不足")
+        self.assertIsNone(data["discussion_sentiment"])
 
     def test_discussion_search_fallback_is_unverified(self) -> None:
         row = {"title": "中石科技讨论", "snippet": "可能订单恢复", "url": "https://example.test"}
@@ -163,8 +165,12 @@ class PipelineEfficiencyTest(unittest.TestCase):
             "fetch_state": "ok",
             "source_chain": [{"source": "东方财富股吧", "status": "ok", "error": ""}],
         }
+        news = {"news_posts_total": 0, "news_sources_checked": 3, "news_sources_ok": 3, "news_partial": False, "news_sentiment": None, "fetch_state": "ok", "source_chain": []}
+        history = {"social_history_snapshots": 1, "social_new_topics_24h": 1, "social_persistent_topics": 0, "social_fast_spread_topics": 0, "social_rank_jump_max": None, "social_first_seen_at": "2026-08-08T00:00:00+08:00", "social_propagation_status": "首次快照，等待时间序列"}
         with patch.object(social_sentiment, "_cached", side_effect=fake_cached), \
-             patch.object(social_sentiment, "_collect_discussion", return_value=discussion):
+             patch.object(social_sentiment, "_collect_discussion", return_value=discussion), \
+             patch.object(social_sentiment, "_collect_news", return_value=news), \
+             patch.object(social_sentiment, "_update_history", return_value=history):
             data = social_sentiment.collect("000001", "平安银行")
         self.assertEqual(data["fetch_state"], "fallback_ok")
         self.assertEqual(data["discussion_fetch_state"], "ok")
@@ -404,6 +410,22 @@ class PipelineEfficiencyTest(unittest.TestCase):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("duckduckgo", row))
         self.assertIn("searxng:TimeoutError", errors)
+
+    def test_search_public_falls_back_to_duckduckgo_lite(self) -> None:
+        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
+        with patch.dict(
+            os.environ,
+            {
+                "SEARXNG_URL": "",
+                "DDG_MCP_URL": "",
+                "MODA_PUBLIC_SEARCH": "auto",
+            },
+            clear=False,
+        ), patch.object(web_research, "_duckduckgo_html_search", side_effect=TimeoutError), \
+                patch.object(web_research, "_duckduckgo_lite_search", return_value=row):
+            used, rows, errors = web_research._search("auto", "test", 0.1)
+        self.assertEqual((used, rows), ("duckduckgo_lite", row))
+        self.assertIn("duckduckgo_html:TimeoutError", errors)
 
     def test_gap_search_reuses_only_same_day_success(self) -> None:
         row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
@@ -803,14 +825,24 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("A股适用性", report)
         self.assertIn("当前价格：30.00；支撑位：28.00；压力位：33.00", report)
         self.assertIn("F6 是独立的第六层，已计入研究分", report)
-        self.assertIn("**1. 一句话逻辑**\n\n", report)
-        self.assertIn("**6. 评级与证伪条件**\n\n", report)
+        self.assertIn("**1. 投资主张**\n\n", report)
+        self.assertIn("**6. 行动评级与证伪条件**\n\n", report)
+        self.assertIn("投资主张态度为", report)
+        self.assertIn("同行竞争与为什么是它", report)
+        self.assertIn("## 研究评分 📊", report)
+        self.assertIn("## Hard Cap 检查 🛡️", report)
+        self.assertIn("✅", report)
+        self.assertNotIn("F6修正：机构方向", report)
+        self.assertNotIn("## 证据覆盖与行动状态", report)
+        self.assertNotIn("> 🧭 阅读顺序", report)
+        self.assertNotIn("## 数据覆盖与待确认", report)
         self.assertIn("### 技术信号：", report)
         self.assertNotIn("## 机构方法交叉验证", report)
-        self.assertIn("### 莫大视角总览", report)
+        self.assertIn("### 投资判断总览", report)
         self.assertIn("| 核心问题 | 图示 | 大白话结论 | 数据与理由 |", report)
-        self.assertIn("产业与业务", report)
-        self.assertIn("主营包括", report)
+        self.assertIn("投资主张", report)
+        self.assertIn("为什么可能值得买", report)
+        self.assertIn("同行竞争", report)
         self.assertIn("### 核心上下游对应表", report)
         self.assertIn("产业链：半导体设备产业链；公司位置：上游；匹配类型：待确认", report)
         self.assertIn("| 环节 | 核心内容 | 与公司的关系 | 判断 |", report)
@@ -838,7 +870,8 @@ class PipelineEfficiencyTest(unittest.TestCase):
         report = grader.render_report("002389", "航天彩虹", evidence, card, ())
         conclusion = report.split("## 一句话结论与最终判断", 1)[1].split("## 技术分析（easy-tdx 日 K）", 1)[0]
 
-        self.assertIn("航天彩虹主营业务为航空航天产品制造、无人机及相关产品、塑料薄膜制造、光学膜", conclusion)
+        self.assertIn("航天彩虹当前正式行动评级为", conclusion)
+        self.assertIn("主营集中在航空航天产品制造", conclusion)
         self.assertIn("当前价格为18.47元", conclusion)
         self.assertIn("TTM PE为675.40、PB为2.24", conclusion)
         self.assertIn("个股关注度为84.61%，所属行业拥挤度为32.00%", conclusion)

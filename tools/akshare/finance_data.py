@@ -155,7 +155,7 @@ def _normalize_ths_financial_report(frame: pd.DataFrame, report_type: str) -> pd
 # ══════════════════════════════════════════════════════
 
 def fetch_kline_daily(code: str, kline_file: Path | None = None) -> pd.DataFrame:
-    """日K线: 本次共享缓存 → easy_tdx → 东财 → 新浪。"""
+    """日K线: 本次共享缓存 → easy_tdx → 东财 → 新浪 → 腾讯。"""
     if kline_file and kline_file.stem == code and kline_file.exists():
         df = pd.read_csv(kline_file, parse_dates=["date"])
         print(f"  [日K] 共享缓存 → {len(df)} 条")
@@ -175,9 +175,13 @@ def fetch_kline_daily(code: str, kline_file: Path | None = None) -> pd.DataFrame
             frame["pct_chg"] = frame["close"].pct_change() * 100
         return frame
 
+    def tencent() -> pd.DataFrame:
+        from tools.providers.tencent_provider import fetch_kline_daily as fetch_tencent_kline
+        return _normalize_daily(fetch_tencent_kline(code))
+
     result = run_fallback_chain(
         "日K线",
-        [("easy_tdx", easy_tdx), ("AKShare/东方财富", eastmoney), ("AKShare/Sina", sina)],
+        [("easy_tdx", easy_tdx), ("AKShare/东方财富", eastmoney), ("AKShare/Sina", sina), ("Tencent/ifzq", tencent)],
         seconds=12,
         empty=dataframe_empty,
     )
@@ -211,7 +215,7 @@ def fetch_kline_quarterly(code: str, daily: pd.DataFrame | None = None) -> pd.Da
 
 
 def fetch_spot(code: str) -> dict:
-    """实时行情: easy_tdx 单股查询，回退 efinance 单股查询。"""
+    """实时行情: easy_tdx 单股查询，回退 efinance 和腾讯单股查询。"""
     def easy_tdx() -> dict:
         from tools.providers.easy_tdx_provider import fetch_realtime_quote
         return fetch_realtime_quote(code)
@@ -220,7 +224,16 @@ def fetch_spot(code: str) -> dict:
         from tools.efinance.provider import fetch_realtime_quotes
         return fetch_realtime_quotes(code)
 
-    result = run_fallback_chain("实时行情", [("easy_tdx", easy_tdx), ("efinance", efinance)], seconds=8, empty=lambda value: not bool(value))
+    def tencent() -> dict:
+        from tools.providers.tencent_provider import fetch_realtime_quote
+        return fetch_realtime_quote(code)
+
+    result = run_fallback_chain(
+        "实时行情",
+        [("easy_tdx", easy_tdx), ("efinance", efinance), ("Tencent/qt.gtimg.cn", tencent)],
+        seconds=8,
+        empty=lambda value: not bool(value),
+    )
     payload = dict(result.value or {})
     if result.ok:
         print(f"  [行情] {result.source} → {payload.get('最新价', 'N/A')}")
@@ -512,7 +525,7 @@ def build_report(code: str, name: str,
     L = [
         f"# 基本面+行情报告: {name}({code})",
         f"",
-        f"> 采集时间: {ts}  |  数据源: easy_tdx/TDX/Sina + efinance/AKShare",
+        f"> 采集时间: {ts}  |  数据源: easy_tdx/TDX/Sina + efinance/AKShare + Tencent",
         f"> 雪球: [个股页](https://xueqiu.com/S/{'SH' if code[0]=='6' else 'SZ'}{code})  "
         f"|  东财: [股吧](https://guba.eastmoney.com/list,{code},99,f.html)",
         f"",
