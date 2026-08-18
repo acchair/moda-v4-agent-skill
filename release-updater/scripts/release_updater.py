@@ -21,7 +21,6 @@ from typing import Any
 
 REPO = "acchair/moda-v4-agent-skill"
 API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
-SKILL_NAME = "moda-release-updater"
 MANAGED_SCRIPT_MARKER = "release_updater.py"
 MANAGED_COMMAND_MARKER = "session-start"
 STATE_VERSION = 1
@@ -53,6 +52,14 @@ def default_target() -> Path:
     explicit = os.environ.get("MODA_V4_ROOT")
     if explicit:
         return Path(explicit).expanduser().resolve()
+    runtime_config = source_skill_root() / ".moda-companion-runtime.json"
+    if runtime_config.is_file():
+        try:
+            configured = json.loads(runtime_config.read_text(encoding="utf-8")).get("moda_root")
+            if configured:
+                return Path(configured).expanduser().resolve()
+        except (OSError, ValueError, TypeError):
+            pass
     source_parent = source_skill_root().parent
     if (source_parent / "SKILL.md").is_file() and (source_parent / "tools").is_dir():
         return source_parent
@@ -415,21 +422,43 @@ def install_hook(script: Path, target: Path, hooks_path: Path | None = None) -> 
 
 
 def install_global(target: Path, hooks_path: Path | None = None) -> dict[str, str]:
-    destination = Path.home() / ".agents" / "skills" / SKILL_NAME
-    copy_skill(source_skill_root(), destination)
-    hook = install_hook(destination / "scripts" / "release_updater.py", target, hooks_path)
-    payload = load_state()
-    payload["target"] = str(target.resolve())
-    write_state(payload)
-    return {"skill": str(destination), "hook": str(hook), "target": str(target.resolve())}
+    del hooks_path
+    installer = target.resolve() / "moda-companion" / "install.py"
+    if not installer.is_file():
+        raise UpgradeBlocked(f"缺少统一安装入口：{installer}")
+    return {
+        "status": "use_companion_installer",
+        "message": "更新器已并入莫大 Agent，不再安装独立 moda-release-updater Skill。",
+        "command": shell_command(
+            [sys.executable, str(installer), "codex", "--moda-root", str(target.resolve())]
+        ),
+        "target": str(target.resolve()),
+    }
 
 
 def refresh_installed_skill(target: Path) -> None:
-    updated_source = target / "release-updater"
-    if updated_source.is_dir():
-        destination = Path.home() / ".agents" / "skills" / SKILL_NAME
-        copy_skill(updated_source, destination)
-        install_hook(destination / "scripts" / "release_updater.py", target)
+    updated_source = target / "moda-companion"
+    if not updated_source.is_dir():
+        return
+    destinations = (
+        Path.home() / ".agents" / "skills" / "moda-companion",
+        Path.home() / ".claude" / "skills" / "moda-companion",
+        Path("/var/minis/skills/moda-companion"),
+    )
+    for destination in destinations:
+        if not destination.is_dir():
+            continue
+        for source_file in updated_source.rglob("*"):
+            if not source_file.is_file():
+                continue
+            relative = source_file.relative_to(updated_source)
+            if relative.as_posix() in {".moda-companion-runtime.json"} or "_runtime" in relative.parts:
+                continue
+            output = destination / relative
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, output)
+        if destination == destinations[0]:
+            install_hook(destination / "scripts" / "release_updater.py", target)
 
 
 def upgrade(target: Path, release: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -462,6 +491,32 @@ def unskip(tag: str) -> bool:
     payload["skipped_tags"] = sorted(skipped)
     write_state(payload)
     return existed
+
+
+def skip_version(tag: str) -> bool:
+    normalized = validate_tag(tag)
+    payload = load_state()
+    skipped = {str(item) for item in payload.get("skipped_tags", [])}
+    existed = normalized in skipped
+    save_skipped(payload, normalized)
+    return not existed
+
+
+def upgrade_now(target: Path, expected_tag: str) -> dict[str, str]:
+    release = latest_release()
+    if not release:
+        raise UpgradeBlocked("GitHub 尚无可安装的正式 Release")
+    tag = validate_tag(str(release.get("tag_name") or ""))
+    expected = validate_tag(expected_tag)
+    if tag != expected:
+        raise UpgradeBlocked(f"最新版本已从 {expected} 变为 {tag}，请重新确认后再升级")
+    payload = load_state()
+    payload["latest_tag"] = tag
+    payload["latest_release_name"] = str(release.get("name") or tag)
+    payload["latest_release_summary"] = release_summary(release)
+    write_state(payload)
+    detail = upgrade(target, release, payload)
+    return {"status": "upgraded", "tag": tag, "detail": detail}
 
 
 def show_release_prompt(target: Path, release: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -536,6 +591,15 @@ def show_release_prompt(target: Path, release: dict[str, Any], payload: dict[str
 def perform_check(target: Path, *, prompt: bool, force: bool = False) -> dict[str, Any]:
     payload = load_state()
     if not force and checked_today(payload):
+        tag = str(payload.get("latest_tag") or "")
+        skipped = {str(item) for item in payload.get("skipped_tags", [])}
+        if tag and tag not in skipped and not release_installed(target, tag, payload):
+            return {
+                "status": "update_available",
+                "tag": tag,
+                "summary": str(payload.get("latest_release_summary") or payload.get("latest_release_name") or tag),
+                "cached": True,
+            }
         return {"status": "already_checked", "date": today_text()}
     try:
         release = latest_release()
@@ -549,6 +613,7 @@ def perform_check(target: Path, *, prompt: bool, force: bool = False) -> dict[st
     payload = load_state()
     payload["latest_tag"] = tag
     payload["latest_release_name"] = str(release.get("name") or tag)
+    payload["latest_release_summary"] = release_summary(release)
     write_state(payload)
     if tag in {str(item) for item in payload.get("skipped_tags", [])}:
         return {"status": "skipped", "tag": tag}
@@ -600,7 +665,7 @@ def session_start(target: Path) -> dict[str, Any]:
 
 def worker(target: Path) -> None:
     try:
-        perform_check(target, prompt=True)
+        perform_check(target, prompt=False)
     finally:
         release_lock()
 
@@ -623,7 +688,13 @@ def parse_args() -> argparse.Namespace:
     check_parser.add_argument("--no-prompt", action="store_true")
     check_parser.add_argument("--force", action="store_true")
 
+    upgrade_parser = commands.add_parser("upgrade-now")
+    upgrade_parser.add_argument("--target", type=Path, default=default_target())
+    upgrade_parser.add_argument("--tag", required=True)
+
     commands.add_parser("status")
+    skip_parser = commands.add_parser("skip")
+    skip_parser.add_argument("--tag", required=True)
     unskip_parser = commands.add_parser("unskip")
     unskip_parser.add_argument("--tag", required=True)
     return parser.parse_args()
@@ -644,6 +715,10 @@ def main() -> None:
             prompt=not args.no_prompt,
             force=args.force,
         )
+    elif args.command == "upgrade-now":
+        result = upgrade_now(args.target.expanduser().resolve(), args.tag)
+    elif args.command == "skip":
+        result = {"tag": args.tag, "added": skip_version(args.tag)}
     elif args.command == "unskip":
         result = {"tag": args.tag, "removed": unskip(args.tag)}
     else:

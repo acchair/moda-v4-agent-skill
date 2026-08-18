@@ -41,12 +41,45 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertEqual(result["status"], "already_checked")
         latest.assert_not_called()
 
+    def test_checked_today_returns_cached_pending_update(self) -> None:
+        state = updater.load_state()
+        updater.record_check(state, status="ok")
+        state = updater.load_state()
+        state["latest_tag"] = "v9.0.0"
+        state["latest_release_summary"] = "Moda v9 changes"
+        updater.write_state(state)
+        with mock.patch.object(updater, "release_installed", return_value=False):
+            result = updater.perform_check(Path(self.temporary.name), prompt=False)
+        self.assertEqual(result["status"], "update_available")
+        self.assertTrue(result["cached"])
+
     def test_skip_and_unskip_version(self) -> None:
         state = updater.load_state()
         updater.save_skipped(state, "v1.2.3")
         self.assertIn("v1.2.3", updater.load_state()["skipped_tags"])
         self.assertTrue(updater.unskip("v1.2.3"))
         self.assertNotIn("v1.2.3", updater.load_state()["skipped_tags"])
+
+    def test_skip_version_is_idempotent(self) -> None:
+        self.assertTrue(updater.skip_version("v1.2.3"))
+        self.assertFalse(updater.skip_version("v1.2.3"))
+        self.assertEqual(updater.load_state()["skipped_tags"], ["v1.2.3"])
+
+    def test_upgrade_now_requires_the_confirmed_latest_tag(self) -> None:
+        release = {"tag_name": "v2.0.0", "name": "Moda 2", "body": "Changes"}
+        with (
+            mock.patch.object(updater, "latest_release", return_value=release),
+            mock.patch.object(updater, "upgrade", return_value="done") as upgrade,
+        ):
+            result = updater.upgrade_now(Path(self.temporary.name), "v2.0.0")
+        self.assertEqual(result, {"status": "upgraded", "tag": "v2.0.0", "detail": "done"})
+        upgrade.assert_called_once()
+
+    def test_upgrade_now_blocks_when_latest_tag_changed(self) -> None:
+        release = {"tag_name": "v2.0.1", "name": "Moda 2.0.1", "body": "Changes"}
+        with mock.patch.object(updater, "latest_release", return_value=release):
+            with self.assertRaises(updater.UpgradeBlocked):
+                updater.upgrade_now(Path(self.temporary.name), "v2.0.0")
 
     def test_skipped_release_does_not_open_prompt(self) -> None:
         state = updater.load_state()
@@ -122,6 +155,17 @@ class ReleaseUpdaterTests(unittest.TestCase):
             and updater.MANAGED_COMMAND_MARKER in command
         ]
         self.assertEqual(len(managed), 1)
+
+    def test_legacy_install_redirects_without_creating_standalone_skill(self) -> None:
+        target = Path(self.temporary.name) / "moda-v4"
+        installer = target / "moda-companion" / "install.py"
+        installer.parent.mkdir(parents=True)
+        installer.write_text("", encoding="utf-8")
+        with mock.patch.object(updater.Path, "home", return_value=Path(self.temporary.name) / "home"):
+            result = updater.install_global(target)
+        self.assertEqual(result["status"], "use_companion_installer")
+        self.assertIn("moda-companion", result["command"])
+        self.assertFalse((Path(self.temporary.name) / "home/.agents/skills/moda-release-updater").exists())
 
 
 if __name__ == "__main__":

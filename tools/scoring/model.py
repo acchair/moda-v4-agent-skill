@@ -6,9 +6,6 @@ from typing import Any, Iterable
 from tools.scoring.alpha_crosscheck import evaluate as evaluate_alpha_crosscheck
 
 
-RATING_ORDER = ("不碰", "学习仓", "矛", "根")
-
-
 @dataclass(frozen=True)
 class SubfactorResult:
     key: str
@@ -79,8 +76,6 @@ class Scorecard:
     base_score: float
     adjustment_score: float
     final_score: float
-    rating: str
-    rating_reason: str
     signal: str
     hard_caps: tuple[dict[str, str], ...]
     verified_points: float = 0.0
@@ -88,9 +83,6 @@ class Scorecard:
     unknown_maximum: float = 0.0
     coverage: float = 0.0
     research_score: float = 0.0
-    action_rating: str = "卖出"
-    action_rating_reason: str = ""
-    legacy_rating: str = "不碰"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,8 +91,6 @@ class Scorecard:
             "base_score": self.base_score,
             "adjustment_score": self.adjustment_score,
             "final_score": self.final_score,
-            "rating": self.rating,
-            "rating_reason": self.rating_reason,
             "signal": self.signal,
             "hard_caps": list(self.hard_caps),
             "verified_points": self.verified_points,
@@ -108,9 +98,6 @@ class Scorecard:
             "unknown_maximum": self.unknown_maximum,
             "coverage": self.coverage,
             "research_score": self.research_score,
-            "action_rating": self.action_rating,
-            "action_rating_reason": self.action_rating_reason,
-            "legacy_rating": self.legacy_rating,
         }
 
 
@@ -417,17 +404,24 @@ def _score_f2(evidence: dict[str, Any]) -> FactorResult:
 
     quality = _number(evidence.get("top10_quality"))
     fund_change = _number(evidence.get("fund_holding_change_pct"))
-    if quality is None and fund_change is None:
-        items.append(_missing("top10_quality", "前十大股东质量", 2, "缺少前十大股东名单、性质或基金季度变化"))
+    northbound_change = _number(evidence.get("northbound_holding_change_20d_pct"))
+    institution_change = fund_change if fund_change is not None else northbound_change
+    if quality is None and institution_change is None:
+        items.append(_missing("top10_quality", "前十大股东质量", 2, "缺少前十大股东名单、基金季度变化或沪深港通持股变化"))
     else:
         score = (quality or 0) * 1.5
-        if fund_change is not None:
-            score += 0.5 if fund_change > 0 else 0.25 if fund_change == 0 else 0
+        if institution_change is not None:
+            score += 0.5 if institution_change > 0 else 0.25 if institution_change == 0 else 0
+        change_reason = (
+            f"基金持股比例变化 {fund_change:.2f} 个百分点" if fund_change is not None
+            else f"沪深港通持股比例20日变化 {northbound_change:.2f} 个百分点" if northbound_change is not None
+            else "机构持仓变化需人工确认"
+        )
         items.append(_subfactor(
             evidence, "top10_quality", "前十大股东质量", score, 2,
-            evidence.get("top10_quality_reason", "按国资、产业资本、长期机构和基金季度变化判断"),
-            ("top10_quality", "fund_holding_change_pct"),
-            partial=evidence.get("top10_partial", False) or quality is None or fund_change is None,
+            f"{evidence.get('top10_quality_reason', '按国资、产业资本和长期机构判断')}；{change_reason}",
+            ("top10_quality", "fund_holding_change_pct", "northbound_holding_change_20d_pct"),
+            partial=evidence.get("top10_partial", False) or quality is None or institution_change is None,
         ))
 
     pledge = _number(evidence.get("pledge_ratio"))
@@ -579,7 +573,14 @@ def _score_f4(evidence: dict[str, Any]) -> FactorResult:
         items.append(_missing("overseas", "出口/海外收入", 3, "缺少按地区披露的海外收入比例"))
     else:
         score = 3 if overseas >= 30 else 2 if overseas >= 10 else 1 if overseas > 0 else 0
-        items.append(_subfactor(evidence, "overseas", "出口/海外收入", score, 3, f"海外收入占比 {overseas:.2f}%", ("overseas_revenue_ratio",)))
+        period = str(evidence.get("overseas_revenue_period") or "")
+        period_text = f"（{period}）" if period else ""
+        items.append(_subfactor(
+            evidence, "overseas", "出口/海外收入", score, 3,
+            f"海外收入占比 {overseas:.2f}%{period_text}",
+            ("overseas_revenue_ratio",),
+            partial=evidence.get("overseas_revenue_partial", False),
+        ))
 
     realization_score, details, keys = 0.0, [], []
     for key, label in (("revenue_yoy", "营收同比"), ("profit_yoy", "归母净利润同比")):
@@ -898,55 +899,6 @@ def _adjustments(evidence: dict[str, Any], f1_score: float) -> tuple[AdjustmentR
     return institutional_result, technical_result, sentiment_result, catalyst_result
 
 
-def _base_rating(score: float) -> str:
-    if score >= 85:
-        return "根"
-    if score >= 70:
-        return "矛"
-    if score >= 60:
-        return "学习仓"
-    return "不碰"
-
-
-def _cap_rating(rating: str, cap: str) -> str:
-    return RATING_ORDER[min(RATING_ORDER.index(rating), RATING_ORDER.index(cap))]
-
-
-def _action_rating(
-    research_score: float,
-    coverage: float,
-    caps: list[dict[str, str]],
-) -> tuple[str, str]:
-    def action_from_research(score: float) -> str:
-        if score >= 70:
-            return "买入"
-        if score >= 60:
-            return "持有"
-        return "卖出"
-
-    def action_cap(cap: str) -> str:
-        return "卖出" if cap == "不碰" else "持有"
-
-    hard_risk = next((item for item in caps if item["result"] == "已触发" and item["cap"] == "不碰"), None)
-    if hard_risk:
-        return "卖出", hard_risk["condition"]
-    triggered = [item for item in caps if item["result"] == "已触发"]
-    rating = action_from_research(research_score)
-    if triggered:
-        capped = [action_cap(item["cap"]) for item in triggered]
-        if "卖出" in capped:
-            rating = "卖出"
-        elif "持有" in capped and rating == "买入":
-            rating = "持有"
-        cap_text = "；".join(f"{item['condition']}，行动评级最高为{action_cap(item['cap'])}" for item in triggered)
-        reason = cap_text
-    else:
-        reason = "按研究分映射为买入/持有/卖出"
-    if coverage < 0.60:
-        reason += f"；证据覆盖率 {coverage:.1%} 低于 60%，评级仅作当前证据下的研究判断"
-    return rating, reason
-
-
 def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     core_factors = tuple(_apply_web_fallback(factor, evidence) for factor in (
         _score_f1(evidence), _score_f2(evidence), _score_f3(evidence), _score_f4(evidence),
@@ -958,8 +910,6 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     base_score = round(sum(factor.score for factor in (*core_factors, f5)), 2)
     adjustment_score = round(f6.score, 2)
     final_score = _bounded(base_score + adjustment_score, 0, 100)
-    legacy_rating = _base_rating(final_score)
-    rating = legacy_rating
     caps: list[dict[str, str]] = []
 
     web_results = evidence.get("web_subfactor_results") if isinstance(evidence.get("web_subfactor_results"), dict) else {}
@@ -970,37 +920,24 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
     }
     st_risk = evidence.get("st_risk") is True or (evidence.get("st_risk") is None and "st_risk" in web_hard_caps)
     if st_risk:
-        caps.append({"condition": "ST 或退市风险", "result": "已触发", "cap": "不碰"})
-        rating = "不碰"
+        caps.append({"condition": "ST 或退市风险", "result": "已触发", "decision_effect": "强制退出"})
     else:
-        caps.append({"condition": "ST 或退市风险", "result": "未触发" if evidence.get("st_risk") is False else "需人工确认", "cap": "无" if evidence.get("st_risk") is False else "需人工确认"})
+        caps.append({"condition": "ST 或退市风险", "result": "未触发" if evidence.get("st_risk") is False else "需人工确认", "decision_effect": "无" if evidence.get("st_risk") is False else "需人工确认"})
 
     controller_action = evidence.get("controller_action")
     if controller_action is None and "controller_reduction" in web_hard_caps:
         controller_action = "reduction"
     if controller_action == "reduction":
-        caps.append({"condition": "控股股东或实控人减持", "result": "已触发", "cap": "学习仓"})
-        rating = _cap_rating(rating, "学习仓")
+        caps.append({"condition": "控股股东或实控人减持", "result": "已触发", "decision_effect": "最高等待"})
     else:
-        caps.append({"condition": "控股股东或实控人减持", "result": "未触发" if controller_action in ("increase", "stable") else "需人工确认", "cap": "无" if controller_action in ("increase", "stable") else "需人工确认"})
+        caps.append({"condition": "控股股东或实控人减持", "result": "未触发" if controller_action in ("increase", "stable") else "需人工确认", "decision_effect": "无" if controller_action in ("increase", "stable") else "需人工确认"})
 
     price = _number(evidence.get("price_percentile_3y"))
     congestion = _number(evidence.get("market_congestion"))
     congestion_fresh = evidence.get("market_congestion_fresh") is True
     hot_cap = price is not None and price > 0.80 and congestion is not None and congestion_fresh and congestion >= 0.80
     hot_known_safe = price is not None and price <= 0.80 or (price is not None and congestion is not None and congestion_fresh)
-    caps.append({"condition": "价格高位且市场拥挤过热", "result": "已触发" if hot_cap else "未触发" if hot_known_safe else "需人工确认", "cap": "矛" if hot_cap else "无" if hot_known_safe else "需人工确认"})
-    if hot_cap:
-        rating = _cap_rating(rating, "矛")
-
-    triggered = [item for item in caps if item["result"] == "已触发"]
-    base_rating = _base_rating(final_score)
-    legacy_rating = rating
-    if triggered:
-        cap_text = "；".join(f"{item['condition']}，评级最高为{item['cap']}" for item in triggered)
-        rating_reason = f"综合分 {_bounded(final_score, 0, 100):g} 对应{base_rating}；{cap_text}"
-    else:
-        rating_reason = f"综合分 {_bounded(final_score, 0, 100):g} 对应{rating}，且未触发评级上限"
+    caps.append({"condition": "价格高位且市场拥挤过热", "result": "已触发" if hot_cap else "未触发" if hot_known_safe else "需人工确认", "decision_effect": "最高等待" if hot_cap else "无" if hot_known_safe else "需人工确认"})
     all_items = [item for factor in factors for item in factor.subfactors]
     total_maximum = sum(item.maximum for item in all_items)
     verified_points = round(sum(item.verified_points for item in all_items), 2)
@@ -1013,19 +950,12 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
         0,
         100,
     )
-    action_rating, action_reason = _action_rating(research_score, coverage, caps)
-    rating_reason = (
-        f"研究分 {research_score:g}，证据覆盖率 {coverage:.1%}；"
-        f"行动评级 {action_rating}：{action_reason}"
-    )
     return Scorecard(
         factors=factors,
         adjustments=adjustments,
         base_score=base_score,
         adjustment_score=adjustment_score,
         final_score=final_score,
-        rating=legacy_rating,
-        rating_reason=rating_reason,
         signal=str(evidence.get("technical_signal") or "需人工确认"),
         hard_caps=tuple(caps),
         verified_points=verified_points,
@@ -1033,7 +963,4 @@ def score_evidence(evidence: dict[str, Any]) -> Scorecard:
         unknown_maximum=unknown_maximum,
         coverage=coverage,
         research_score=research_score,
-        action_rating=action_rating,
-        action_rating_reason=action_reason,
-        legacy_rating=legacy_rating,
     )

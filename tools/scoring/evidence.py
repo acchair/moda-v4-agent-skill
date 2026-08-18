@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from functools import lru_cache
 import json
 from pathlib import Path
 import re
@@ -8,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from tools.scoring.announcement_rules import extract_announcement_events
+from tools.scoring.announcement_rules import classify_controller_action, extract_announcement_events
 from tools.scoring.classification_db import (
     SOURCE_LABEL as CLASSIFICATION_DB_SOURCE,
     has_category,
@@ -23,17 +24,32 @@ SOURCE_LABELS = {
     "business_data": "EastMoney/F10",
     "tdx_analysis": "easy_tdx/TDX",
     "announcements": "easy_tdx/CNINFO + AKShare/CNINFO",
-    "market_events": "EastMoney + Sina",
+    "market_events": "EastMoney + Sina + 沪深港通",
     "popularity": "EastMoney/stockrank",
     "supply_demand": "AKShare/futures",
     "congestion": "乐咕乐股/申万二级行业拥挤度",
     "social_sentiment": "公开社交热榜 + 个股讨论接口/搜索 + 财经快讯",
     "macro_policy": "AKShare/PBOC + gov.cn",
-    "web_research": "SearXNG + DuckDuckGo MCP",
+    "web_research": "SearXNG + 360 搜索 + DuckDuckGo + 带引用的模型搜索",
     "industry_prosperity": "乐咕乐股(B级) + AKShare/申万",
 }
 REPORTS = tuple(SOURCE_LABELS)
 COMMENT_PATTERN = re.compile(r"<!--\s*(moda_[a-z_]+):\s*(\{.*?\})\s*-->", re.S)
+
+
+@lru_cache(maxsize=1)
+def _load_chains_config() -> dict[str, Any]:
+    """Load static chain definitions once per process.
+
+    Both the regular pipeline and the full-universe sector screener can call
+    chain matching many times in one process. Re-reading YAML for each stock
+    turns a lightweight screen into an avoidable bottleneck.
+    """
+    path = ROOT / "tools" / "scoring" / "chains.yaml"
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return raw if isinstance(raw, dict) else {}
 
 TRACK_GROUPS: dict[str, dict[str, Any]] = {
     "AI 算力与数据中心": {
@@ -213,10 +229,9 @@ def _derive_legacy_fields(evidence: dict[str, Any], reports: dict[str, str]) -> 
 
 
 def _chain_match(evidence: dict[str, Any]) -> None:
-    path = ROOT / "tools" / "scoring" / "chains.yaml"
-    if not path.exists():
+    raw = _load_chains_config()
+    if not raw:
         return
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     industry_text = str(evidence.get("industry", "")).lower()
     primary_parts = [
         industry_text,
@@ -253,11 +268,13 @@ def _chain_match(evidence: dict[str, Any]) -> None:
             stage_score += sum(item and item in context for item in keywords)
             if stage_score <= 0:
                 continue
+            keyword_hits = [item for item in keywords if item and item in context]
+            if chain.get("require_primary_anchor") and not (primary_aliases or keyword_hits):
+                continue
             primary_score = alias_score + stage_score
             if exact_name_alias:
                 primary_score += 5.0
             score = primary_score + 0.25 * sum(item and item in concept_context and item not in context for item in keywords)
-            keyword_hits = [item for item in keywords if item and item in context]
             specific_hits = [term for term in specific_terms if term.lower() in context and term.lower() in keywords]
             specificity = len(specific_hits) * 2 + len(keyword_hits)
             if any(term in chain_name.lower() for term in ("半导体", "电子特气")) and specific_hits:
@@ -293,8 +310,10 @@ def _chain_match(evidence: dict[str, Any]) -> None:
         return
     if best:
         source = "chains.yaml"
-        _set(evidence, "chain_stage", best["stage"], source)
-        _set(evidence, "chain_name", best["chain_name"], source)
+        # A preceding report can carry a stale, broad concept-chain label. The
+        # current primary-business match is the authoritative chain assignment.
+        _set(evidence, "chain_stage", best["stage"], source, overwrite=True)
+        _set(evidence, "chain_name", best["chain_name"], source, overwrite=True)
         _set(evidence, "business_chain_match", min(1.0, best["score"] / 3), source)
         evidence["chain_matches"] = [
             {
@@ -335,10 +354,16 @@ def _chain_match(evidence: dict[str, Any]) -> None:
         evidence["business_match_reason"] = f"匹配 {best['chain_name']}，位置为 {best['stage']}{ratio_text}{specific_text}"
 
 
-def _chokepoint_match(evidence: dict[str, Any]) -> None:
+@lru_cache(maxsize=1)
+def _load_chokepoint_segments() -> tuple[dict[str, str], ...]:
     path = ROOT / "tools" / "scoring" / "chokepoint_segments.csv"
     if not path.exists():
-        return
+        return ()
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return tuple(dict(row) for row in csv.DictReader(handle))
+
+
+def _chokepoint_match(evidence: dict[str, Any]) -> None:
     name = str(evidence.get("name", ""))
     context = " ".join([
         str(evidence.get("industry", "")),
@@ -346,18 +371,17 @@ def _chokepoint_match(evidence: dict[str, Any]) -> None:
         " ".join(str(item) for item in evidence.get("business_items", [])[:30]),
     ])
     best: tuple[float, str, bool] | None = None
-    with path.open(encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            stocks = str(row.get("key_stocks", ""))
-            segment = str(row.get("segment_name", ""))
-            exact = bool(name and name in stocks)
-            contextual = bool(segment and segment in context)
-            if not exact and not contextual:
-                continue
-            score = _float(row.get("chokepoint_score")) or 0
-            candidate = (score, segment, not exact)
-            if best is None or candidate[0] > best[0]:
-                best = candidate
+    for row in _load_chokepoint_segments():
+        stocks = str(row.get("key_stocks", ""))
+        segment = str(row.get("segment_name", ""))
+        exact = bool(name and name in stocks)
+        contextual = bool(segment and segment in context)
+        if not exact and not contextual:
+            continue
+        score = _float(row.get("chokepoint_score")) or 0
+        candidate = (score, segment, not exact)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
     if best:
         _set(evidence, "chokepoint_score", best[0], "chokepoint_segments.csv")
         evidence["chokepoint_segment"] = best[1]
@@ -490,6 +514,53 @@ def _leadership_evidence(evidence: dict[str, Any], reports: dict[str, str]) -> N
         _set(evidence, "leadership_strength", strength, SOURCE_LABELS.get(directory, directory))
     evidence["leadership_reason"] = reason
     evidence["leadership_partial"] = strength < 1.0 or len(missing_dimensions) > 0
+
+
+def _annual_report_evidence(evidence: dict[str, Any]) -> None:
+    """Promote only conservative annual-report facts into scoring inputs.
+
+    The full annual-report object remains available to the research packet. This
+    bridge intentionally leaves order amounts, capacity utilization, industry
+    supply/demand and peer comparisons untouched when the report does not give
+    those facts in a score-compatible form.
+    """
+    annual = evidence.get("annual_report")
+    if not isinstance(annual, dict) or annual.get("status") != "已验证":
+        return
+    period = str(annual.get("report_period") or "年度报告")
+    source = f"CNINFO 年度报告（{period}）"
+
+    control_chain = annual.get("control_chain")
+    if isinstance(control_chain, dict):
+        shareholder = str(control_chain.get("controlling_shareholder") or "").strip()
+        controller = str(control_chain.get("actual_controller") or "").strip()
+        industrial_support = str(control_chain.get("industrial_support") or "").strip()
+        if shareholder and controller and industrial_support and "background_quality" not in evidence:
+            _set(evidence, "background_quality", 0.6, source)
+            evidence["background_partial"] = True
+            evidence["background_reason"] = (
+                f"年报披露控股股东 {shareholder}、实际控制人 {controller}；{industrial_support}。"
+                "产业资本身份已确认，但未以此替代市场地位、订单或财务安全证据"
+            )
+
+    specialized = annual.get("specialized")
+    if isinstance(specialized, dict) and "specialized_strength" not in evidence:
+        entity = str(specialized.get("entity") or "子公司")
+        qualification = str(specialized.get("qualification") or "国家级专精特新资质")
+        _set(evidence, "specialized_strength", 0.5, source)
+        evidence["specialized_partial"] = True
+        evidence["specialized_reason"] = (
+            f"年报披露子公司 {entity} 获 {qualification}；资质主体为子公司，按部分覆盖计入"
+        )
+
+    overseas = annual.get("overseas_revenue")
+    if isinstance(overseas, dict) and "overseas_revenue_ratio" not in evidence:
+        ratio = _float(overseas.get("ratio_pct"))
+        if ratio is not None:
+            _set(evidence, "overseas_revenue_ratio", ratio, source)
+            _set(evidence, "overseas_revenue_period", str(overseas.get("period") or period), source)
+            _set(evidence, "overseas_revenue_fiscal_year", str(annual.get("fiscal_year") or ""), source)
+            evidence["overseas_revenue_partial"] = True
 
 
 def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) -> None:
@@ -651,12 +722,9 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
 
     titles = [str(item) for item in evidence.get("announcement_titles", [])]
     title_text = " ".join(titles)
-    reduction = re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}减持|减持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text)
-    increase = re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}增持|增持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text)
-    if reduction:
-        _set(evidence, "controller_action", "reduction", SOURCE_LABELS["announcements"], overwrite=True)
-    elif increase:
-        _set(evidence, "controller_action", "increase", SOURCE_LABELS["announcements"], overwrite=True)
+    controller_action = classify_controller_action(titles)
+    if controller_action:
+        _set(evidence, "controller_action", controller_action, SOURCE_LABELS["announcements"], overwrite=True)
 
     if "st_risk" not in evidence:
         normalized_name = str(evidence.get("security_name") or evidence.get("name") or "").upper().replace(" ", "")
@@ -668,6 +736,7 @@ def _derive_framework_fields(evidence: dict[str, Any], reports: dict[str, str]) 
     elif evidence.get("announcement_coverage_complete") is True:
         _set(evidence, "audit_risk", False, SOURCE_LABELS["announcements"])
 
+    _annual_report_evidence(evidence)
     _leadership_evidence(evidence, reports)
     specialized_hits = [term for term in SPECIALIZED_TERMS if term in full_context]
     if specialized_hits and not evidence.get("classification_db_specialized"):
@@ -878,8 +947,14 @@ def build_evidence(code: str, name: str, reports: dict[str, str]) -> dict[str, A
     for directory, report in reports.items():
         source = SOURCE_LABELS.get(directory, directory)
         for payload in _extract_comments(report):
+            source_overrides = payload.get("metric_source_overrides", {})
+            if not isinstance(source_overrides, dict):
+                source_overrides = {}
             for key, value in payload.items():
-                _set(evidence, key, value, source, overwrite=True)
+                if key == "metric_source_overrides":
+                    continue
+                metric_source = str(source_overrides.get(key) or source)
+                _set(evidence, key, value, metric_source, overwrite=True)
     _derive_legacy_fields(evidence, reports)
     _classification_database_evidence(evidence)
     _derive_framework_fields(evidence, reports)

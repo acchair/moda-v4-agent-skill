@@ -1,4 +1,4 @@
 interface:
   display_name: "莫大 V4 A 股分析"
-  short_description: "按莫大六层方法分析 A 股，输出研究分、行动评级与来源核验"
-  default_prompt: "Use $moda-v4 to analyze an A-share stock with the fixed six-factor report. Preserve evidence status and mark missing evidence for manual confirmation."
+  short_description: "按莫大方法分析 A 股，输出 V4 假设优先判断、因果断点、三情景赔率与五态"
+  default_prompt: "Use $moda-v4 to analyze an A-share stock with the fixed six-factor report. Preserve evidence status and mark missing evidence for manual confirmation. For a sector, use the evidence-first sector packet and do not convert a sector state into a stock trade decision."

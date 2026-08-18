@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from tools.data_call import run_with_timeout
+from tools.providers.eastmoney_transport import post as eastmoney_post
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "popularity"
 API = "https://emappdata.eastmoney.com/stockrank/getCurrentLatest"
 
@@ -28,7 +29,7 @@ def _collect_primary(code: str, timeout: float = 12) -> dict:
         "marketType": "",
         "srcSecurityCode": _market_code(code),
     }
-    response = requests.post(API, json=payload, timeout=timeout)
+    response = eastmoney_post(API, json=payload, timeout=timeout)
     response.raise_for_status()
     data = response.json().get("data") or {}
     rank = data.get("rank")

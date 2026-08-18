@@ -69,11 +69,13 @@ def _endpoint_group(endpoints: dict[str, str]) -> dict[str, Any]:
 
 
 def core_health() -> dict[str, Any]:
+    from tools.providers.baostock_provider import health_check as baostock_health
     from tools.providers.easy_tdx_provider import health_check as easy_tdx_health
     from tools.providers.tencent_provider import health_check as tencent_health
 
     return {
         "easy_tdx": easy_tdx_health(cache_seconds=60),
+        "baostock": baostock_health(cache_seconds=60),
         "tencent": tencent_health(cache_seconds=60),
         "akshare": _package("akshare"),
         "efinance": _package("efinance"),

@@ -1,7 +1,7 @@
 interface:
-  display_name: "Moda Release 更新器"
-  short_description: "每天检查一次 Moda 正式版本并安全升级"
-  default_prompt: "Use $moda-release-updater to check the latest Moda release and manage update preferences safely."
+  display_name: "Moda Companion 内部更新器"
+  short_description: "仅供莫大 Agent 内部检查与升级版本"
+  default_prompt: "Use $moda-release-updater only as the internal updater behind $moda-companion."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

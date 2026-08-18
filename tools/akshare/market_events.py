@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from tools.providers import a_stock_data_provider as provider
+from tools.providers.eastmoney_transport import get as eastmoney_get
 from tools.data_call import run_with_timeout
 
 
@@ -211,7 +212,7 @@ def fetch_pledge(code: str, timeout: float = 15) -> pd.DataFrame:
         "source": "WEB",
         "client": "WEB",
     }
-    response = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    response = eastmoney_get(url, params=params, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
     result = response.json().get("result") or {}
     return pd.DataFrame(result.get("data") or [])
@@ -242,6 +243,17 @@ def fetch_fund_holding(code: str) -> pd.DataFrame:
             result["报告季度"] = quarter
             return result
     return pd.DataFrame()
+
+
+def fetch_northbound_holding(code: str) -> pd.DataFrame:
+    frame = ak.stock_hsgt_individual_em(symbol=code)
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    result = frame.copy()
+    if "持股日期" in result.columns:
+        result["持股日期"] = pd.to_datetime(result["持股日期"], errors="coerce")
+        result = result.dropna(subset=["持股日期"]).sort_values("持股日期")
+    return result
 
 
 def _holder_metrics(holders: list[dict]) -> dict:
@@ -317,6 +329,7 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
         "research": (lambda: provider.research_reports(code, max_pages=1), None),
         "pledge": (lambda: fetch_pledge(code), lambda: _ak_pledge(code)),
         "fund_holding": (lambda: fetch_fund_holding(code), None),
+        "northbound_holding": (lambda: fetch_northbound_holding(code), None),
     }
     frames: dict[str, pd.DataFrame] = {}
     fetch_status: dict[str, dict] = {}
@@ -341,7 +354,8 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
 
     structured = _holder_metrics(holders)
     structured["market_event_fetch_status"] = fetch_status
-    structured["fetch_state"] = "failed" if any(item.get("fetch_state") == "failed" for item in fetch_status.values()) else "fallback_ok" if any(item.get("fetch_state") == "fallback_ok" for item in fetch_status.values()) else "empty" if all(item.get("fetch_state") == "empty" for item in fetch_status.values()) else "ok"
+    core_status = [item for key, item in fetch_status.items() if key != "northbound_holding"]
+    structured["fetch_state"] = "failed" if any(item.get("fetch_state") == "failed" for item in core_status) else "fallback_ok" if any(item.get("fetch_state") == "fallback_ok" for item in core_status) else "empty" if all(item.get("fetch_state") == "empty" for item in core_status) else "ok"
     structured["source_chain"] = {key: item.get("source_chain", []) for key, item in fetch_status.items()}
     structured["pledge_fetch_ok"] = fetch_status["pledge"]["ok"]
     structured["pledge_fetch_state"] = fetch_status["pledge"]["fetch_state"]
@@ -369,6 +383,27 @@ def collect(code: str) -> tuple[dict, dict[str, pd.DataFrame]]:
             change = structured.get("fund_holding_change_pct")
             change_text = f"；基金持股比例变化 {change:.2f} 个百分点" if change is not None else "；基金持仓变化需人工确认"
             structured["top10_quality_reason"] += change_text
+
+    northbound = frames["northbound_holding"]
+    structured["northbound_fetch_state"] = fetch_status["northbound_holding"]["fetch_state"]
+    if not northbound.empty:
+        latest = northbound.iloc[-1]
+        ratio = pd.to_numeric(pd.Series([latest.get("持股数量占A股百分比")]), errors="coerce").iloc[0]
+        shares = pd.to_numeric(pd.Series([latest.get("持股数量")]), errors="coerce").iloc[0]
+        market_value = pd.to_numeric(pd.Series([latest.get("持股市值")]), errors="coerce").iloc[0]
+        if pd.notna(ratio):
+            structured["northbound_holding_ratio"] = float(ratio)
+        if pd.notna(shares):
+            structured["northbound_holding_shares"] = float(shares)
+        if pd.notna(market_value):
+            structured["northbound_holding_market_value"] = float(market_value)
+        structured["northbound_holding_date"] = str(latest.get("持股日期"))[:10]
+        if len(northbound) >= 21:
+            earlier = pd.to_numeric(
+                pd.Series([northbound.iloc[-21].get("持股数量占A股百分比")]), errors="coerce"
+            ).iloc[0]
+            if pd.notna(ratio) and pd.notna(earlier):
+                structured["northbound_holding_change_20d_pct"] = float(ratio - earlier)
 
     holder_num = frames["holder_num"]
     if not holder_num.empty:
@@ -472,6 +507,10 @@ def build_report(code: str, name: str, structured: dict, frames: dict[str, pd.Da
         "## 基金持仓季度变化",
         "",
         *_frame_table(frames["fund_holding"], ["报告季度", "持股机构简称", "持股比例", "持股比例增幅", "占流通股比例"]),
+        "",
+        "## 沪深港通持股",
+        "",
+        *_frame_table(frames["northbound_holding"].sort_values("持股日期", ascending=False) if not frames["northbound_holding"].empty else frames["northbound_holding"], ["持股日期", "持股数量", "持股市值", "持股数量占A股百分比", "今日增持股数"]),
         "",
         "## 概念与研报",
         "",

@@ -10,6 +10,7 @@ import sys
 import time
 from typing import Any
 
+import pandas as pd
 import requests
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +22,8 @@ from tools.industry_aliases import aliases_for, normalize_industry
 
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "congestion"
 CACHE_PATH = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "sw_congestion_daily.json"
+SW_SNAPSHOT_CACHE_PATH = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "sw_second_snapshot_daily.json"
+SW_PROXY_CACHE_DIR = ROOT / "knowledge" / "research" / "pipeline" / "cache" / "sw_congestion_proxy"
 LEGULEGU_PAGE = "https://www.legulegu.com/stockdata/sw-congestion/sec-level"
 LEGULEGU_API = "https://www.legulegu.com/api/stockdata/sw-congestion"
 UA = "moda-v4-congestion/1.0"
@@ -110,6 +113,60 @@ def _number(value: Any) -> float | None:
     return number if number == number else None
 
 
+def _fetch_sw_second_snapshot() -> dict[str, Any]:
+    import akshare as ak
+
+    frame = ak.index_realtime_sw(symbol="二级行业")
+    if frame is None or frame.empty:
+        raise ValueError("申万二级行业快照为空")
+    rows = []
+    for _, row in frame.iterrows():
+        code = str(row.get("指数代码") or "").replace(".SI", "")
+        name = str(row.get("指数名称") or "").strip()
+        if code and name:
+            rows.append({"sw_second_code": code, "sw_second_name": name, "sw_first_code": ""})
+    if not rows:
+        raise ValueError("申万二级行业快照无有效代码")
+    return {"source": "申万宏源研究/二级行业指数", "source_date": shanghai_now().date().isoformat(), "rows": rows}
+
+
+def _rolling_percentile(values: pd.Series, window: int = 20, history: int = 120) -> float | None:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    rolling = numeric.rolling(window).mean().dropna().tail(history)
+    if len(rolling) < 40:
+        return None
+    return float((rolling <= rolling.iloc[-1]).mean())
+
+
+def _fetch_sw_activity_proxy(code: str, name: str) -> dict[str, Any]:
+    import akshare as ak
+
+    frame = ak.index_hist_sw(symbol=code.replace(".SI", ""), period="day")
+    if frame is None or frame.empty or "日期" not in frame.columns:
+        raise ValueError("申万行业指数历史为空")
+    frame = frame.sort_values("日期")
+    amount = _rolling_percentile(frame.get("成交额", pd.Series(dtype=float)))
+    volume = _rolling_percentile(frame.get("成交量", pd.Series(dtype=float)))
+    known = [value for value in (amount, volume) if value is not None]
+    if not known:
+        raise ValueError("申万行业指数成交活跃度样本不足")
+    combined = sum(known) / len(known)
+    source_date = str(pd.to_datetime(frame["日期"], errors="coerce").dropna().iloc[-1].date())
+    return {
+        "source": "申万宏源研究/二级行业指数成交活跃度代理",
+        "source_url": "https://www.swsresearch.com/institute_sw/allIndex/releasedIndex",
+        "source_date": source_date,
+        "sw_second_code": code,
+        "sw_second_name": name,
+        "amount_percentile": amount,
+        "volume_percentile": volume,
+        "congestion": round(combined, 4),
+        "strength_score": round(combined * 100, 2),
+        "strength": _strength(combined * 100),
+        "proxy": True,
+    }
+
+
 def _map_industry(industry: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     values = aliases_for(industry)
     value = values[0] if values else _normalize(industry)
@@ -157,9 +214,63 @@ def collect(
     mapping = _map_industry(industry, payload.get("rows") or [])
     matched = next((row for row in payload.get("rows") or [] if row.get("sw_second_code") == mapping.get("sw_second_code")), None)
     fresh = bool(record.get("usable") and age_days is not None and 0 <= age_days <= max_age_days)
-    result = {
+    proxy: dict[str, Any] = {}
+    proxy_record: dict[str, Any] = {}
+    if not (matched and fresh):
+        try:
+            snapshot_record = load_daily_json(
+                SW_SNAPSHOT_CACHE_PATH,
+                _fetch_sw_second_snapshot,
+                force_refresh=refresh,
+                now=checked_at,
+            )
+            snapshot = dict(snapshot_record.get("payload") or {})
+            proxy_mapping = _map_industry(industry, snapshot.get("rows") or [])
+            if proxy_mapping.get("sw_second_code"):
+                if not matched:
+                    mapping = proxy_mapping
+                proxy_code = str(proxy_mapping["sw_second_code"]).replace(".SI", "")
+                proxy_path = SW_PROXY_CACHE_DIR / f"{proxy_code}.json"
+                proxy_record = load_daily_json(
+                    proxy_path,
+                    lambda: _fetch_sw_activity_proxy(proxy_code, str(proxy_mapping.get("sw_second_name") or "")),
+                    force_refresh=refresh,
+                    now=checked_at,
+                )
+                proxy = dict(proxy_record.get("payload") or {}) if proxy_record.get("usable") else {}
+        except Exception as exc:
+            proxy_record = {"fetch_state": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+    use_proxy = not (matched and fresh) and bool(proxy)
+    if use_proxy:
+        matched = {
+            "congestion": proxy.get("congestion"),
+            "strength": proxy.get("strength"),
+            "strength_score": proxy.get("strength_score"),
+            "turnover_percentile": proxy.get("volume_percentile") * 100 if proxy.get("volume_percentile") is not None else None,
+            "amount_ratio_percentile": proxy.get("amount_percentile") * 100 if proxy.get("amount_percentile") is not None else None,
+            "sw_second_name": proxy.get("sw_second_name"),
+            "sw_second_code": proxy.get("sw_second_code"),
+            "sw_first_code": "",
+        }
+        source_date = proxy.get("source_date")
+        try:
+            age_days = (checked_at.date() - datetime.fromisoformat(str(source_date)).date()).days
+        except (TypeError, ValueError):
+            age_days = None
+        fresh = bool(age_days is not None and 0 <= age_days <= max_age_days)
+
+    primary_source = proxy.get("source") if use_proxy else payload.get("source") or "乐咕乐股/申万二级行业拥挤度"
+    source_chain = list(payload.get("source_chain") or [{
         "source": payload.get("source") or "乐咕乐股/申万二级行业拥挤度",
-        "source_url": payload.get("source_url") or LEGULEGU_PAGE,
+        "status": "ok" if record.get("usable") else "failed",
+        "error": record.get("error") or "",
+    }])
+    if proxy:
+        source_chain.append({"source": proxy.get("source"), "status": "ok", "error": ""})
+    result = {
+        "source": primary_source,
+        "source_url": proxy.get("source_url") if use_proxy else payload.get("source_url") or LEGULEGU_PAGE,
         "source_date": source_date,
         "market_congestion": matched.get("congestion") if matched else None,
         "market_congestion_date": source_date,
@@ -178,9 +289,16 @@ def collect(
         "market_congestion_checked_at": record.get("checked_at"),
         "market_congestion_cache_hit": record.get("cache_hit", False),
         "market_congestion_cache_status": record.get("status"),
-        "fetch_state": "stale" if record.get("fetch_state") == "stale" or not fresh else "ok" if matched else "empty",
-        "source_chain": payload.get("source_chain") or [{"source": payload.get("source") or "乐咕乐股/申万二级行业拥挤度", "status": "ok" if record.get("usable") else "failed", "error": record.get("error") or ""}],
-        "market_congestion_error": record.get("error"),
+        "market_congestion_proxy": use_proxy,
+        "market_congestion_crosscheck": proxy.get("congestion") if not use_proxy else None,
+        "market_congestion_crosscheck_consistent": (
+            abs(float(matched.get("congestion")) - float(proxy.get("congestion"))) <= 0.25
+            if matched and proxy and not use_proxy and matched.get("congestion") is not None and proxy.get("congestion") is not None
+            else None
+        ),
+        "fetch_state": "fallback_ok" if use_proxy and fresh else "stale" if not fresh else "ok" if matched else "empty",
+        "source_chain": source_chain,
+        "market_congestion_error": record.get("error") or proxy_record.get("error"),
         "market_congestion_rows": len(payload.get("rows") or []),
     }
     return result
@@ -196,7 +314,7 @@ def build_report(data: dict[str, Any], name: str = "") -> str:
     return "\n".join([
         f"# 申万二级行业拥挤度：{name}" if name else "# 申万二级行业拥挤度",
         "",
-        f"> 采集时间：{time.strftime('%Y-%m-%d %H:%M:%S')}  |  数据源：乐咕乐股/申万二级行业拥挤度",
+        f"> 采集时间：{time.strftime('%Y-%m-%d %H:%M:%S')}  |  数据源：{data.get('source') or '需人工确认'}",
         "",
         f"<!-- moda_congestion: {json.dumps(data, ensure_ascii=False)} -->",
         "",
@@ -208,6 +326,7 @@ def build_report(data: dict[str, Any], name: str = "") -> str:
         f"- 数据日期：{data.get('market_congestion_date') or '需人工确认'}；今日检查：{data.get('market_congestion_checked_date') or '需人工确认'}",
         f"- 新鲜度：{fresh}；共享行业行数：{data.get('market_congestion_rows', 0)}",
         f"- 缓存状态：{data.get('market_congestion_cache_status') or '需人工确认'}" + (f"；失败原因：{data['market_congestion_error']}" if data.get("market_congestion_error") else ""),
+        f"- 口径：{'申万指数成交额/成交量滚动分位代理' if data.get('market_congestion_proxy') else '乐咕换手率/成交额拥挤度'}",
         "",
         "说明：同一交易日全量申万二级行业数据只采集一次，其他股票按申万二级映射共享；过期数据只展示，不参与情绪修正或 Hard Cap。",
         "",

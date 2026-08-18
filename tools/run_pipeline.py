@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -79,20 +82,109 @@ def _report_coverage(label: str, path: Path) -> int:
     return int("评分:" in text or "ALPHA-SOROS" in text)
 
 
-def prepare_kline(code: str) -> Path | None:
-    try:
-        from tools.providers.easy_tdx_provider import fetch_kline_daily
+def _kline_cache_paths(code: str) -> tuple[Path, Path]:
+    return CACHE_ROOT / "kline" / f"{code}.csv", CACHE_ROOT / "kline" / f"{code}.meta.json"
 
-        frame = fetch_kline_daily(code)
+
+def _read_kline_cache(code: str, *, require_today: bool) -> tuple[Path | None, dict]:
+    from tools.daily_cache import shanghai_now
+    from tools.providers.kline_quality import validate_kline_frame
+
+    path, meta_path = _kline_cache_paths(code)
+    if not path.exists() or not meta_path.exists():
+        return None, {}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if require_today and meta.get("checked_date") != shanghai_now().date().isoformat():
+            return None, meta
+        frame, _ = validate_kline_frame(pd.read_csv(path), minimum_rows=60, max_age_days=14)
         if frame.empty:
-            return None
-        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        path = CACHE_ROOT / f"{code}.csv"
-        frame.to_csv(path, index=False)
-        print(f"[kline] easy_tdx -> {len(frame)} rows")
+            return None, meta
+        return path, meta
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None, {}
+
+
+def _write_kline_cache(code: str, frame, meta: dict) -> Path:
+    path, meta_path = _kline_cache_paths(code)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    csv_tmp = path.with_suffix(".csv.tmp")
+    meta_tmp = meta_path.with_suffix(".json.tmp")
+    frame.to_csv(csv_tmp, index=False)
+    meta_tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(csv_tmp, path)
+    os.replace(meta_tmp, meta_path)
+    return path
+
+
+def prepare_kline(code: str, *, refresh: bool = False) -> Path | None:
+    from tools.data_call import dataframe_empty, run_fallback_chain
+    from tools.daily_cache import shanghai_now
+    from tools.providers.kline_quality import validate_kline_frame
+
+    if not refresh:
+        cached, meta = _read_kline_cache(code, require_today=True)
+        if cached:
+            print(f"[kline] persistent cache -> {meta.get('rows', '?')} rows")
+            return cached
+    result = None
+    try:
+        def easy_tdx() -> pd.DataFrame:
+            from tools.providers.easy_tdx_provider import fetch_kline_daily
+
+            frame, _ = validate_kline_frame(fetch_kline_daily(code), minimum_rows=60, max_age_days=14)
+            return frame
+
+        def baostock() -> pd.DataFrame:
+            from tools.providers.baostock_provider import fetch_kline_daily
+
+            frame, _ = validate_kline_frame(fetch_kline_daily(code), minimum_rows=60, max_age_days=14)
+            return frame
+
+        result = run_fallback_chain(
+            "共享日K",
+            [("easy_tdx/TDX", easy_tdx), ("BaoStock", baostock)],
+            seconds=25,
+            empty=dataframe_empty,
+        )
+        if not result.ok or not isinstance(result.value, pd.DataFrame):
+            raise RuntimeError(result.error or "all shared K-line sources failed")
+        frame = result.value
+        issues = list(frame.attrs.get("quality_issues", []))
+        now = shanghai_now()
+        path = _write_kline_cache(code, frame, {
+            "checked_date": now.date().isoformat(),
+            "checked_at": now.isoformat(),
+            "latest_date": frame.attrs.get("latest_date"),
+            "rows": len(frame),
+            "fetch_state": result.fetch_state,
+            "quality_issues": issues,
+            "source_chain": result.source_chain or [],
+        })
+        print(f"[kline] {result.source} -> {len(frame)} rows")
         return path
     except Exception as exc:
         print(f"[kline] shared cache unavailable: {type(exc).__name__}: {exc}")
+        cached, meta = _read_kline_cache(code, require_today=False)
+        if cached:
+            now = shanghai_now()
+            meta.update({
+                "checked_date": now.date().isoformat(),
+                "checked_at": now.isoformat(),
+                "fetch_state": "stale",
+                "fetch_error": f"{type(exc).__name__}: {exc}",
+                "source_chain": [
+                    *((result.source_chain or []) if result is not None else [
+                        {"source": "easy_tdx/TDX", "status": "failed", "error": type(exc).__name__},
+                        {"source": "BaoStock", "status": "failed", "error": "not attempted"},
+                    ]),
+                    {"source": "persistent-cache", "status": "stale", "error": ""},
+                ],
+            })
+            meta_path = _kline_cache_paths(code)[1]
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[kline] stale persistent cache -> {meta.get('rows', '?')} rows")
+            return cached
         return None
 
 
@@ -160,7 +252,13 @@ def unresolved_targets(
             "original_reason": item.reason,
         }
         for factor in card.factors if factor.key != "F6"
-        for item in factor.subfactors if item.status in {"需人工确认", "部分覆盖"}
+        for item in factor.subfactors if item.status in {
+            "需人工确认",
+            "部分覆盖",
+            "已搜索未命中",
+            "搜索失败，需人工确认",
+            "搜索结果待正文核验，需人工确认",
+        }
     ]
     if evidence.get("classification_db_specialized") is True:
         targets = [
@@ -215,12 +313,15 @@ def main() -> None:
         code, resolved_input_name = resolve_stock_input(args.stock, args.name)
     except ValueError as exc:
         parser.error(str(exc))
-    input_name = args.name.strip() or resolved_input_name
+    requested_name = args.name.strip()
+    if requested_name == code:
+        requested_name = ""
+    input_name = requested_name or resolved_input_name
 
     started_ts = time.time()
     common = ["--stock", code, "--name", input_name or code]
     refresh_args = ["--refresh"] if args.refresh else []
-    kline_path = prepare_kline(code)
+    kline_path = prepare_kline(code, refresh=args.refresh)
     kline_args = ["--kline-file", str(kline_path)] if kline_path else []
     first_wave = [
         ("finance_data", "tools/akshare/finance_data.py", [*common, *kline_args], 180),
@@ -247,7 +348,7 @@ def main() -> None:
             started_ts,
             reports=report_snapshot,
         )
-        resolved_name = args.name.strip() or discovered_name or resolved_input_name or code
+        resolved_name = requested_name or discovered_name or resolved_input_name or code
         resolved_common = ["--stock", code, "--name", resolved_name]
         congestion = (
             "congestion",
