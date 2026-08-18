@@ -132,9 +132,7 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 
 访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。移动端不依赖 PowerShell、Windows 路径或本机浏览器登录状态；缺少本地搜索服务时自动降级到公共搜索，并保留来源状态。
 
-OpenMinis 安装命令会自动备份原 `SOUL.md`、启用莫大 SOUL，并在 `/var/minis/memory/moda-companion-memory.json` 预置公开方法记忆，不需要安装后再手动启动人格。
 
-Windows 使用 `python` 也可以。Apple/macOS 和 OpenMinis 使用 `python3`；Apple 移动端应将仓库放入 Agent 的工作区，由 Agent 的 Linux 沙箱执行。所有报告仍写入 `knowledge/research/`，不依赖 Windows 专用路径。
 
 ## 🗒️ 更新日志
 
@@ -144,11 +142,6 @@ Windows 使用 `python` 也可以。Apple/macOS 和 OpenMinis 使用 `python3`�
 
 仓库不包含浏览器登录状态、Cookie、本机日志或历史分析报告。可选代理凭据只从环境变量读取，禁止写入代码、报告或提交记录。
 
-## ❤️ 支持项目
-
-如果这个项目对选股研究有帮助，可以前往[雪球主页](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)支持作者。
-
-[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973?scene=1036&share_uid=1500823973&share_type=weixin&data_type=link&data_model=utl&fix_uid=1500823973)
 
 ## ⚠️ 免责声明
 
