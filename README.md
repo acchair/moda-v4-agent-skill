@@ -132,7 +132,11 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 
 访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。移动端不依赖 PowerShell、Windows 路径或本机浏览器登录状态；缺少本地搜索服务时自动降级到公共搜索，并保留来源状态。
 
+## 支持项目
 
+可以前往[雪球主页](https://xueqiu.com/u/1500823973)了解作者的公开研究。
+
+[![支持作者](./_2026-07-31_000022_473.png)](https://xueqiu.com/u/1500823973)
 
 ## 🗒️ 更新日志
 
