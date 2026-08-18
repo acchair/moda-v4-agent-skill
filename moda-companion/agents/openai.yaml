@@ -1,7 +1,7 @@
 interface:
   display_name: "莫大 Agent"
-  short_description: "莫大方法研究、A股分析与长期陪伴"
-  default_prompt: "Use $moda-companion. For a specific A-share, preserve the moda-v4 formal report and then add the Moda Agent interpretation."
+  short_description: "单入口完成莫大方法研究、A股分析与版本管理"
+  default_prompt: "Use $moda-companion to collect A-share facts, produce Agent Judgment V4 with a market-stage-versus-fundamental-stage contradiction, main-business-anchored industry positioning, why-now and marginal-change reasoning, market mismatch, peer choice, causal breakpoint, scenarios and a five-state decision, finalize it, and return the complete report inline. For sector questions, use the sector fact packet and evidence ordering; sector_state is not a stock decision."
 
 policy:
   allow_implicit_invocation: true

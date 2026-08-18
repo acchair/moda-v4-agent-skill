@@ -1,4 +1,5 @@
-akshare==1.18.83
+akshare==1.18.91
+baostock==0.9.3
 beautifulsoup4==4.15.0
 easy-tdx==1.20.6
 efinance==0.5.9

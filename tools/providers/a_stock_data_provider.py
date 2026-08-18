@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
-import requests
+
+from tools.providers.eastmoney_transport import get as eastmoney_get, wait_turn
 
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 REPORT_API = "https://reportapi.eastmoney.com/report/list"
@@ -20,17 +20,10 @@ HEADERS = {
     "Connection": "close",
 }
 
-_SESSION = requests.Session()
-_SESSION.headers.update(HEADERS)
-_LAST_REQUEST_AT = 0.0
-
-
 def _throttle(interval: float = 0.35) -> None:
-    global _LAST_REQUEST_AT
-    wait = interval - (time.perf_counter() - _LAST_REQUEST_AT)
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_REQUEST_AT = time.perf_counter()
+    """Compatibility shim for callers that used the old local throttle."""
+    del interval
+    wait_turn()
 
 
 def _market_id(code: str) -> int:
@@ -41,7 +34,14 @@ def _market_id(code: str) -> int:
 
 
 def clean_code(code: str) -> str:
-    return str(code).strip().upper().replace("SH", "").replace("SZ", "").replace("BJ", "").replace(".", "")
+    raw = str(code or "").strip().upper()
+    raw = re.sub(r"^(?:SH|SZ|BJ)", "", raw)
+    raw = re.sub(r"(?:\.SH|\.SZ|\.BJ)$", "", raw)
+    if not re.fullmatch(r"\d{6}", raw):
+        raise ValueError("东方财富接口仅接受六位 A 股代码")
+    if raw.startswith(("43", "83", "87")):
+        raise ValueError("北交所历史代码可能返回陈旧行情，请先使用当前 920xxx 代码")
+    return raw
 
 
 def secid(code: str) -> str:
@@ -60,8 +60,7 @@ def _parse_jsonp(text: str) -> Any:
 
 
 def _get_json(url: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
-    _throttle()
-    resp = _SESSION.get(url, params=params or {}, timeout=timeout)
+    resp = eastmoney_get(url, params=params or {}, timeout=timeout, headers=HEADERS)
     resp.raise_for_status()
     return _parse_jsonp(resp.text)
 
@@ -119,8 +118,9 @@ def eastmoney_datacenter(
     return _df(payload)
 
 
-def research_reports(code: str, max_pages: int = 2) -> pd.DataFrame:
+def research_reports(code: str, max_pages: int = 2, look_back_days: int = 730) -> pd.DataFrame:
     clean = clean_code(code)
+    begin = date.today() - timedelta(days=max(30, int(look_back_days)))
     rows: list[dict[str, Any]] = []
     for page in range(1, max_pages + 1):
         payload = _get_json(
@@ -130,7 +130,7 @@ def research_reports(code: str, max_pages: int = 2) -> pd.DataFrame:
                 "pageSize": 20,
                 "qType": 0,
                 "code": clean,
-                "beginTime": "2020-01-01",
+                "beginTime": begin.isoformat(),
                 "endTime": date.today().isoformat(),
             },
             timeout=12,
@@ -207,7 +207,23 @@ def fund_flow_minute(code: str) -> pd.DataFrame:
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62",
         },
     )
-    return stock_fund_flow_120d(code) if not _records(payload) else _df(payload)
+    rows = []
+    for item in _records(payload):
+        parts = str(item.get("kline", "")).split(",")
+        if len(parts) < 6:
+            continue
+        rows.append({
+            "time": parts[0],
+            "main_net": parts[1],
+            "small_net": parts[2],
+            "medium_net": parts[3],
+            "large_net": parts[4],
+            "super_large_net": parts[5],
+            "data_source": "eastmoney-minute",
+        })
+    return pd.DataFrame(rows, columns=(
+        "time", "main_net", "small_net", "medium_net", "large_net", "super_large_net", "data_source",
+    ))
 
 
 def concept_blocks(code: str) -> pd.DataFrame:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -105,9 +106,12 @@ def collect_web_signal(name: str, industry: str, timeout: float = 10) -> dict[st
     queries = _industry_web_queries(name, industry)
     layers: dict[str, Any] = {}
     errors: list[str] = []
+    provider = os.getenv("MODA_SEARCH_PROVIDER", "auto").strip().lower()
+    if provider not in {"auto", "searxng", "duckduckgo", "so360", "model"}:
+        provider = "auto"
     for key, query in queries.items():
         layer = INDUSTRY_WEB_LAYERS[key]
-        used, rows, query_errors = web_research._search("auto", query, timeout)
+        used, rows, query_errors = web_research._search(provider, query, timeout)
         errors.extend(f"{key}:{item}" for item in query_errors)
         relevant: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -159,7 +163,7 @@ def collect_web_signal(name: str, industry: str, timeout: float = 10) -> dict[st
         "layers": layers,
         "queries": queries,
         "errors": errors,
-        "provider": ",".join(sorted({row.get("provider") for item in layers.values() for row in item.get("evidence", []) if row.get("provider")})) or "none",
+        "provider": ",".join(sorted({row.get("provider") for item in layers.values() for row in item.get("evidence", []) if row.get("provider")})) or provider,
         "conflicts": [f"网络旁证{key}层出现正负信号并存" for key, item in layers.items() if item.get("positive_count", 0) and item.get("negative_count", 0)],
     }
 
@@ -516,7 +520,7 @@ def collect(
         "industry_market_signal": market,
         "industry_capex_signal": "不可用",
         "industry_prosperity_conflicts": all_conflicts,
-        "industry_prosperity_sources": ["乐咕乐股/申万行业中位数(B级)", "AKShare/申万行业指数", "AKShare/商品供需与宏观", "SearXNG/DuckDuckGo 中国金融网站（未核验旁证）"],
+        "industry_prosperity_sources": ["乐咕乐股/申万行业中位数(B级)", "AKShare/申万行业指数", "AKShare/商品供需与宏观", "网络检索中国金融网站（未核验旁证）"],
         "industry_web_signal": web_signal,
         "industry_cycle_cold": overall == "走弱" if coverage == "完整" else None,
         "industry_prosperity_checked_date": record.get("checked_date"),

@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from tools.scoring.sentiment_engine import SentimentScorer
 from tools.scoring.web_research import _search
+from tools.providers.eastmoney_transport import get as eastmoney_get
 
 OUTPUT_BASE = ROOT / "knowledge" / "research" / "stock_discussion"
 UA = "moda-v4-discussion/1.0"
@@ -105,7 +106,7 @@ def _eastmoney(code: str, count: int = 20) -> list[dict[str, Any]]:
     successes = 0
     for url in urls:
         try:
-            response = requests.get(url, headers={"User-Agent": UA}, timeout=5)
+            response = eastmoney_get(url, headers={"User-Agent": UA}, timeout=5)
             response.raise_for_status()
             html = response.text
             successes += 1

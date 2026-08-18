@@ -32,6 +32,15 @@ HARD_DETAIL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DATE_PATTERN = re.compile(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?")
+CORPORATE_ACTION_RULES = {
+    "equity_incentive": ("股权激励", "限制性股票", "股票期权", "员工持股计划"),
+    "buyback": ("回购",),
+    "increase": ("增持",),
+    "reduction": ("减持",),
+    "pledge": ("质押",),
+}
+CONTROLLER_TERMS = ("控股股东", "实际控制人", "实控人")
+NON_REDUCTION_TERMS = ("不减持", "未减持", "终止减持", "取消减持", "停止减持")
 
 
 def _valid_date(value: Any) -> str:
@@ -43,6 +52,26 @@ def _valid_date(value: Any) -> str:
         return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
     except ValueError:
         return ""
+
+
+def is_non_reduction_notice(title: str) -> bool:
+    """Return whether a title explicitly says a reduction will not proceed."""
+    text = str(title or "")
+    return "减持" in text and any(term in text for term in NON_REDUCTION_TERMS)
+
+
+def classify_controller_action(titles: list[str]) -> str | None:
+    """Classify controller action without treating a no-reduction pledge as a sale."""
+    has_increase = False
+    for raw_title in titles:
+        title = str(raw_title or "")
+        if not title or not any(term in title for term in CONTROLLER_TERMS):
+            continue
+        if "减持" in title and not is_non_reduction_notice(title):
+            return "reduction"
+        if "增持" in title:
+            has_increase = True
+    return "increase" if has_increase else None
 
 
 def extract_announcement_events(announcements: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -88,6 +117,37 @@ def catalyst_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "catalyst_categories": categories,
         "verified_catalyst_count": min(2, len(confirmed_categories)) if events else 0,
     }
+
+
+def extract_corporate_action_events(announcements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract neutral corporate-action records without treating them as catalysts."""
+    events: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in announcements:
+        title = str(item.get("title") or "").strip()
+        event_date = _valid_date(item.get("date"))
+        if not title or not event_date:
+            continue
+        for category, terms in CORPORATE_ACTION_RULES.items():
+            matched = [term for term in terms if term in title]
+            if not matched:
+                continue
+            if category == "reduction" and is_non_reduction_notice(title):
+                category = "non_reduction_commitment"
+                matched = [term for term in NON_REDUCTION_TERMS if term in title]
+            key = (event_date, category, title)
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({
+                "date": event_date,
+                "title": title,
+                "url": str(item.get("url") or "").strip(),
+                "category": category,
+                "matched_terms": matched,
+                "hard_detail": bool(HARD_DETAIL_PATTERN.search(title)),
+            })
+    return sorted(events, key=lambda item: (item["date"], item["category"], item["title"]), reverse=True)
 
 
 def capex_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:

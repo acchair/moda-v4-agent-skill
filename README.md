@@ -2,16 +2,16 @@
 
 ![moda-v4](./ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8825%E6%97%A5%2020_24_27.png)
 
-面向 A 股研究的六层评分 Skill，支持数据来源标注、保守硬约束和固定格式输出。
+面向 A 股研究的逻辑优先 Skill，支持可证伪假设、数据来源标注、保守硬约束和固定格式输出。
 
-> 📊 六层评分 · 🔎 来源可追溯 · 🧩 缺失数据不猜测 · 🛡️ Hard Cap 风险控制
+> 🧠 逻辑优先 · 🔎 来源可追溯 · 🧩 缺失数据不猜测 · 🛡️ Hard Cap 风险控制
 
 ## 🚀 快速安装
 
 将下面的提示词交给Agent：
 
 ```text
-请将 https://github.com/acchair/moda-v4-agent-skill 安装为 moda-v4 Skill：克隆到你的 skills 目录，安装 requirements.txt，读取 SKILL.md，并保持 tools 与 knowledge 的相对目录结构。随后按六层评分框架分析 A 股。
+请将 https://github.com/acchair/moda-v4-agent-skill 安装为单入口“莫大 Agent”：克隆仓库、安装 requirements.txt，然后运行 moda-companion/install.py 对应平台安装器。只暴露 moda-companion；moda-v4 采集器和版本更新器放在内部，不要安装成独立用户 Skill。
 ```
 
 也可以手动安装：
@@ -20,6 +20,7 @@
 git clone https://github.com/acchair/moda-v4-agent-skill.git
 cd moda-v4-agent-skill
 python -m pip install -r requirements.txt
+python moda-companion/install.py codex --moda-root .
 ```
 
 ## 📈 使用方法
@@ -27,17 +28,17 @@ python -m pip install -r requirements.txt
 直接向 Agent 提供股票名称或六位股票代码，例如：
 
 ```text
-/moda-v4 中国平安
-/moda-v4 601318
+$moda-companion 中国平安
+莫大 Agent，看看 601318
 ```
 
-Agent 会确认股票代码并运行基础流水线：
+Agent 会先确认股票代码，建立最小事实包和 Logic Case，再按逻辑缺口定向补证：
 
 ```bash
-python tools/run_pipeline.py --stock 000001 --name 平安银行
+python moda-companion/scripts/analyze_logic.py 000001 --kind stock --phase baseline
 ```
 
-流水线会获取行情、财务、技术因子和公告数据，并生成六层评分报告。报告保存在 `knowledge/research/`。
+只有逻辑成立且确需正式判断时，才进入完整证据流水线和 Judgment V4。运行数据与逻辑档案保存在 `knowledge/research/`。
 
 重点报告：
 
@@ -50,7 +51,7 @@ knowledge/research/scoring/000001.md
 
 ## 💡 设计理念
 
-以可追溯证据和保守风险约束为核心，让研究结论、行动评级与不确定性保持一致。
+以可追溯证据、可证伪因果链和保守风险约束为核心，让研究事实、投资判断与不确定性保持一致。完整原则见 [设计理念文档](./docs/DESIGN_PRINCIPLES.md)。
 
 ### 🧱 六层评分框架
 
@@ -64,30 +65,24 @@ knowledge/research/scoring/000001.md
 | F6 修正项 | 10 | 4 | 技术结构 4 分、机构方向 2 分、情绪/拥挤度 2 分、风口催化 2 分；已计入总分，不重复加分，也不使用网页补分。 |
 | **合计** | **100** | **28** | **F1-F4 合计 80 分，F5 10 分，F6 10 分；研究分仅在已知证据范围内归一化。** |
 
-行动评级标准：
-
-| 研究分 | 行动评级 |
-|---:|---|
-| `>=70` | 买入 |
-| `60-69` | 持有 |
-| `<60` | 卖出 |
-
-证据覆盖率低于 `60%` 时，仍按研究分生成行动评级，但会明确提示该评级仅基于当前证据；`需人工确认` 表示证据不足、接口失败或搜索未完成，不等于利空，也不自动扣分。
+研究分只用于比较已知证据，不映射交易评级。Agent Judgment V4 先解释“市场走到哪一步、基本面走到哪一步”、主营锚定的产业链、旧逻辑的边际变化与预期差，再使用 `观察 / 等待 / 试错 / 买入 / 退出` 五态；覆盖率低于 `60%` 时最高只能观察。
 
 Hard Cap：
 
-- ST 或退市风险：行动评级为 `卖出`。
-- 控股股东或实控人减持：行动评级最高为 `持有`。
-- 三年价格分位 `>80%` 且新鲜有效的市场拥挤度 `>=80%`：行动评级最高为 `持有`；过期拥挤度只展示，不计分也不触发 Hard Cap。
+- ST 或退市风险：强制 `退出`。
+- 控股股东或实控人减持：最高 `等待`。
+- 三年价格分位 `>80%` 且新鲜有效的市场拥挤度 `>=80%`：最高 `等待`。
 
 搜索结果按来源分级：巨潮资讯、沪深北交易所等法定信息披露正文可作为高确信度证据；雪球、东方财富、大智慧等金融论坛只用于收集线索，不参与确认或计分。
+
+搜索补缺默认按 `SearXNG → DuckDuckGo MCP → DuckDuckGo HTML/Lite → 带引用模型搜索` 回退。首轮覆盖所有 F1-F5 缺口，并按公司、产业、产业链、利润兑现、市场预期选择来源类型；只有正文可读、对象匹配且来源合理的结果才成为未核验线索。模型搜索可使用 OpenAI Responses `web_search`，或通过 `MODA_MODEL_SEARCH_URL` 接入返回 URL 的 DeepSeek/其他搜索网关；普通 Chat API 生成的无引用文本不会进入证据。配置示例见 `.env.example`，真实 API Key 只放本地 `.env`，不要提交仓库。
 
 ### 🧾 输出格式
 
 最终分析固定按以下顺序输出：
 
-1. 原始综合分、研究分、覆盖率、行动评级与技术信号
-2. 一句话结论与六段最终判断
+1. Agent Judgment V4：莫大判断、一句话结论、核心矛盾、产业链定位、为什么现在看、过去为何受压及边际变化、市场叙事/错位、同行选择、因果断点、Bull/Base/Bear、三情景赔率、五态与三项验证
+2. 研究分、覆盖率与技术信号
 3. easy-tdx 技术指标与缠论日线结构
 4. 六层图形概览
 5. 六层评分卡及 F1-F6 逐项诊断
@@ -98,17 +93,19 @@ Hard Cap：
 10. 动态纠错触发器
 11. 数据覆盖、待确认项与免责声明
 
-每个关键判断都标注实际数据来源。报告缺失、接口失败或无法交叉验证的内容统一标记为 `需人工确认`，不会自动转为负面结论；报告另外显示未知可得分上限、已确认扣分和最终行动状态。
+每个关键判断都标注实际数据来源。报告缺失、接口失败或无法交叉验证的内容统一标记为 `需人工确认`，不会自动转为负面结论；报告另外显示未知可得分上限、已确认扣分和当前五态。
 
 ### 🧠 莫大 Agent
 
-仓库内置受莫大公开投资方法与表达方式启发的研究与陪伴型 Agent。它不是莫大本人，也不代表其当前观点；具体 A 股分析始终先保留 moda-v4 正式报告，再追加“莫大 Agent 解读”，不会改写研究分、行动评级、覆盖率、Hard Cap、来源状态或 `需人工确认`。
+仓库内置受莫大公开投资方法与表达方式启发的研究与陪伴型 Agent。它不是莫大本人，也不代表其当前观点。`moda-companion` 是唯一用户入口：内部 moda-v4 采集 `research_packet schema_version=4`，Agent 再形成 V4 投资判断：产业—公司—预期差假设、旧矛盾的边际变化、同行选择、因果断点、Bull/Base/Bear、历史估值赔率、五态和可证伪验证。研究分、覆盖率和 Hard Cap 保持可审计。
+
+板块问题使用独立的事实包和候选比较：产业趋势、供需、利润池、稀缺环节、利润兑现、概念与已计价，最后才输出证据排序。板块状态仅表示“值得研究 / 等待验证 / 暂不优先”，不等同个股五态或交易建议。
 
 ```powershell
 python moda-companion/install.py codex
 ```
 
-安装后可用于行业、投资方法、AI/科技话题和日常陪伴。跨会话只保存用户明确允许的非敏感偏好，不保存账户、成本、持仓、联系方式、Cookie、密码、Token 或 API Key。
+安装器会预置公开的莫大选股方法记忆，包括判断顺序、五类机会、五问过滤器、证据纪律、五态与 Hard Cap；重复安装不会覆盖用户已有记忆。安装后可用于行业、投资方法、AI/科技话题和日常陪伴，不保存账户、成本、持仓、联系方式、Cookie、密码、Token 或 API Key。
 
 ### 📤 导出结果
 
@@ -124,11 +121,10 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 
 | 平台 | 使用方式 | 状态 |
 |---|---|---|
-| Codex | 读取 `SKILL.md` 与 `agents/openai.yaml` | 推荐 |
-| Claude Code | 将仓库放入 Skills 目录并读取 `SKILL.md` | 支持 |
-| Hermes Agent | 使用安装提示词并授予仓库访问权限 | 支持 |
-| OpenMinis | 在手机端安装本 Skill；使用 Python/Linux 沙箱执行数据模块 | 支持 |
-| 其他支持 `SKILL.md` 的 Agent | 复制仓库到对应 Skills 目录 | 支持 |
+| Codex | `python moda-companion/install.py codex --moda-root .` | 推荐 |
+| Claude Code | `python moda-companion/install.py claude --moda-root .` | 支持 |
+| OpenMinis | `python3 moda-companion/install.py openminis --moda-root .` | 支持 |
+| 其他支持 `SKILL.md` 的 Agent | 只暴露 `moda-companion`，将 moda-v4 作为内部运行时 | 需适配 |
 
 ### 📱 手机端
 
@@ -136,24 +132,13 @@ python tools/export_skill_output.py --stock 000001 --name 平安银行 --input f
 
 访问 [OpenMinis](https://openminis.app/) 下载手机端 Agent，即可安装并使用本 Skill。移动端不依赖 PowerShell、Windows 路径或本机浏览器登录状态；缺少本地搜索服务时自动降级到公共搜索，并保留来源状态。
 
+OpenMinis 安装命令会自动备份原 `SOUL.md`、启用莫大 SOUL，并在 `/var/minis/memory/moda-companion-memory.json` 预置公开方法记忆，不需要安装后再手动启动人格。
+
 Windows 使用 `python` 也可以。Apple/macOS 和 OpenMinis 使用 `python3`；Apple 移动端应将仓库放入 Agent 的工作区，由 Agent 的 Linux 沙箱执行。所有报告仍写入 `knowledge/research/`，不依赖 Windows 专用路径。
 
 ## 🗒️ 更新日志
 
-### 2026-08-10
-
-- 新增可选 SearXNG 搜索栈、搜索健康检查和公共搜索回退，方便桌面端与 OpenMinis 使用同一套搜索入口。
-- 行情新增腾讯备用源；财报、互动易和股东户数补充 iSH/OpenMinis 网络失败回退，并保留真实来源与待确认状态。
-- 社交讨论新增新闻情绪、样本覆盖和传播状态，避免单条讨论被误判为整体情绪。
-- 正式报告优化投资主张、同行竞争、技术信号和数据覆盖展示，评分、Hard Cap 与证据状态保持不变。
-- 更新莫大 Agent 的方法说明和 OpenMinis 灵魂配置，继续以 moda-v4 正式报告为唯一评分依据。
-
-### 2026-08-08
-
-- 六层评分框架更新为当前标准：展示 28 个子项、买入/持有/卖出行动评级、覆盖率说明和 Hard Cap。
-- README 将六层评分框架、输出格式、莫大 Agent 和导出结果整合为“设计理念”，并统一补充图标。
-- 新增莫大 Agent 使用说明与 Codex 安装入口；人格解读保留 moda-v4 正式报告的评分、证据和风险约束。
-- 快速安装地址、目录名和调用示例统一为 `moda-v4`。
+完整变更记录见 [CHANGELOG.md](./CHANGELOG.md)。当前版本重点是逻辑优先主流程、Judgment V4、证据边界、板块轻筛和跨平台降级链。
 
 ## 🔒 隐私与安全
 

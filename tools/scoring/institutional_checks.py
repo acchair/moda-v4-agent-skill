@@ -23,6 +23,7 @@ def evaluate(evidence: dict[str, Any], card: Scorecard) -> list[dict[str, str]]:
     catalyst_checked = evidence.get("verified_catalyst_count") is not None
     merger_ready = evidence.get("merger_event_verified") is True
     valuation_ready = comps_ready or _known(evidence, ("pe_ttm", "pb"))
+    dcf_data_ready = _known(evidence, ("free_cash_flow", "net_debt", "total_shares"))
     factor_ready = coverage >= 0.60
     alpha_check = evidence.get("alpha_crosscheck") or {}
     alpha_methods = {item.get("method"): item for item in alpha_check.get("methods", [])}
@@ -30,7 +31,13 @@ def evaluate(evidence: dict[str, Any], card: Scorecard) -> list[dict[str, str]]:
     thesis = alpha_methods.get("投资逻辑追踪", {})
 
     return [
-        _row("DCF 估值", "条件适用", "待数据", "需要自由现金流、净债务、总股本和经审查的增长/WACC 假设；禁止用市值反推 FCF"),
+        _row(
+            "DCF 估值",
+            "条件适用",
+            "待假设" if dcf_data_ready else "待数据",
+            "自由现金流、净债务和总股本已取得；仍需审查增长率、终值和WACC假设"
+            if dcf_data_ready else "需要自由现金流、净债务、总股本和经审查的增长/WACC假设；禁止用市值反推FCF",
+        ),
         _row("Comps 同行估值", "高", "已启用" if comps_ready else "待数据", "PE/PB 与同行中位数交叉验证，不改变六层得分" if comps_ready else "缺少目标或同行可比估值"),
         _row("三表预测", "条件适用", "待数据", "需要完整利润表、资产负债表、现金流量表和资本开支假设"),
         _row("Quick LBO", "低/条件适用", "待场景", "普通 A 股少数股权研究不默认使用；仅在私有化、并购或控股交易场景启用"),

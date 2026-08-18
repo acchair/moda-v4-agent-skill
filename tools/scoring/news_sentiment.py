@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import requests
 
+from tools.providers.eastmoney_transport import get as eastmoney_get
 from tools.scoring.sentiment_engine import SentimentScorer
 
 
@@ -31,7 +32,8 @@ def _normalized_title(value: str) -> str:
 
 
 def _get(url: str, timeout: float = FETCH_TIMEOUT) -> requests.Response:
-    response = requests.get(url, headers={"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}, timeout=timeout)
+    request = eastmoney_get if "eastmoney.com" in url.lower() else requests.get
+    response = request(url, headers={"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}, timeout=timeout)
     response.raise_for_status()
     return response
 

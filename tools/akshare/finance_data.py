@@ -1,10 +1,10 @@
 """
 个股基本面 + 行情数据模块
 ========================
-集成 easy_tdx、Sina、efinance 和 AKShare 获取 A 股行情与基本面数据，
+集成 easy_tdx、BaoStock、Sina、efinance 和 AKShare 获取 A 股行情与基本面数据，
 输出结构化 Markdown 报告供莫大 persona 参考。
 
-数据源优先级: easy_tdx/TDX/Sina → efinance/AKShare
+数据源优先级: easy_tdx/TDX/Sina → BaoStock → efinance/AKShare
 用法:
     python3 tools/akshare/finance_data.py --stock 603290 --name 斯达半导
     python3 tools/akshare/finance_data.py --stock 603290,600460
@@ -28,7 +28,10 @@ apply_patch()
 import akshare as ak
 import pandas as pd
 import numpy as np
-from tools.data_call import dataframe_empty, run_fallback_chain
+from tools.data_call import dataframe_empty, run_fallback_chain, run_with_timeout
+from tools.akshare.business_data import build_structured as build_business_structured
+from tools.akshare.business_data import fetch_business_data
+from tools.providers.kline_quality import validate_kline_frame
 OUTPUT_BASE = ROOT / "knowledge/research/finance_data"
 
 # 东方财富列名 → 统一列名映射
@@ -94,6 +97,7 @@ THS_FINANCIAL_METRICS = {
         "act_cash_flow_net": "经营活动产生的现金流量净额",
         "invest_cash_flow_net": "投资活动产生的现金流量净额",
         "financing_cash_flow_net": "筹资活动产生的现金流量净额",
+        "pay_fixed_assets_etc_cash": "购建固定资产、无形资产和其他长期资产支付的现金",
     },
     "fzb": {
         "cash": "货币资金",
@@ -155,15 +159,33 @@ def _normalize_ths_financial_report(frame: pd.DataFrame, report_type: str) -> pd
 # ══════════════════════════════════════════════════════
 
 def fetch_kline_daily(code: str, kline_file: Path | None = None) -> pd.DataFrame:
-    """日K线: 本次共享缓存 → easy_tdx → 东财 → 新浪 → 腾讯。"""
+    """日K线: 本次共享缓存 → easy_tdx → BaoStock → 东财 → 新浪 → 腾讯。"""
     if kline_file and kline_file.stem == code and kline_file.exists():
-        df = pd.read_csv(kline_file, parse_dates=["date"])
+        df, issues = validate_kline_frame(pd.read_csv(kline_file), minimum_rows=60, max_age_days=14)
+        meta_path = kline_file.with_suffix(".meta.json")
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                meta = {}
         print(f"  [日K] 共享缓存 → {len(df)} 条")
-        return _with_frame_meta(df, fetch_state="ok", source_chain=[{"source": "shared-cache", "status": "ok", "error": ""}])
+        df = _with_frame_meta(
+            df,
+            fetch_state=str(meta.get("fetch_state") or "ok"),
+            source_chain=list(meta.get("source_chain") or [{"source": "shared-cache", "status": "ok", "error": ""}]),
+            error=str(meta.get("fetch_error") or ""),
+        )
+        df.attrs["quality_issues"] = list(dict.fromkeys([*(meta.get("quality_issues") or []), *issues]))
+        return df
 
     def easy_tdx() -> pd.DataFrame:
         from tools.providers.easy_tdx_provider import fetch_kline_daily as fetch_easy_tdx_kline
         return _normalize_daily(fetch_easy_tdx_kline(code))
+
+    def baostock() -> pd.DataFrame:
+        from tools.providers.baostock_provider import fetch_kline_daily as fetch_baostock_kline
+        return _normalize_daily(fetch_baostock_kline(code))
 
     def eastmoney() -> pd.DataFrame:
         return _normalize_daily(ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq"))
@@ -181,8 +203,14 @@ def fetch_kline_daily(code: str, kline_file: Path | None = None) -> pd.DataFrame
 
     result = run_fallback_chain(
         "日K线",
-        [("easy_tdx", easy_tdx), ("AKShare/东方财富", eastmoney), ("AKShare/Sina", sina), ("Tencent/ifzq", tencent)],
-        seconds=12,
+        [
+            ("easy_tdx", easy_tdx),
+            ("BaoStock", baostock),
+            ("AKShare/东方财富", eastmoney),
+            ("AKShare/Sina", sina),
+            ("Tencent/ifzq", tencent),
+        ],
+        seconds=25,
         empty=dataframe_empty,
     )
     frame = result.value if isinstance(result.value, pd.DataFrame) else pd.DataFrame()
@@ -226,7 +254,10 @@ def fetch_spot(code: str) -> dict:
 
     def tencent() -> dict:
         from tools.providers.tencent_provider import fetch_realtime_quote
-        return fetch_realtime_quote(code)
+        quote = fetch_realtime_quote(code)
+        if quote.get("quote_stale_suspect"):
+            raise ValueError("腾讯行情疑似陈旧：零成交且最新价等于昨收")
+        return quote
 
     result = run_fallback_chain(
         "实时行情",
@@ -242,7 +273,7 @@ def fetch_spot(code: str) -> dict:
 
 
 def fetch_company_and_peers(code: str) -> tuple[dict, pd.DataFrame]:
-    """从所属行业板块一次取得行业标签和同行估值快照。"""
+    """Use the TDX snapshot for valuation, scoped to a verified SW level-2 industry."""
     from tools.providers.easy_tdx_provider import fetch_belong_boards, fetch_board_members
 
     try:
@@ -282,8 +313,230 @@ def fetch_company_and_peers(code: str) -> tuple[dict, pd.DataFrame]:
     peers = peers[close > 0].copy()
     peers["_target"] = peers["代码"].eq(code)
     peers = peers.sort_values(["_target", "总市值"], ascending=[False, False]).drop(columns="_target")
-    print(f"  [同行] {board['board_name']} → {len(peers)} 家")
+    peers.attrs["peer_scope_status"] = "需人工确认"
+    peers.attrs["peer_scope_source"] = "通达信行业板块（尚未确认申万二级）"
+    try:
+        from tools.akshare.industry_prosperity import map_industry
+
+        sw_second = ak.sw_index_second_info()
+        mapping = map_industry(info["行业"], {"sw_second": sw_second.to_dict("records"), "sw_first": []})
+        sw_code = str(mapping.get("sw_second_code") or "").replace(".SI", "")
+        if mapping.get("status") == "已验证" and sw_code:
+            components = ak.index_component_sw(symbol=sw_code)
+            component_column = next((item for item in ("证券代码", "成分券代码", "股票代码") if item in components.columns), None)
+            component_codes = set(components[component_column].astype(str).str.zfill(6)) if component_column else set()
+            if code in component_codes:
+                peers = peers[peers["代码"].isin(component_codes)].copy()
+                peers.attrs["peer_scope_status"] = "已验证"
+                peers.attrs["peer_scope_source"] = "申万宏源研究/申万二级成分股"
+                peers.attrs["sw_second_name"] = mapping.get("sw_second_name")
+                peers.attrs["sw_second_code"] = mapping.get("sw_second_code")
+                info.update({
+                    "申万二级": mapping.get("sw_second_name"),
+                    "申万二级代码": mapping.get("sw_second_code"),
+                    "同行候选口径": "同一申万二级行业",
+                })
+    except Exception as exc:
+        print(f"  [同行/申万二级] 确认失败: {type(exc).__name__}: {exc}")
+    print(f"  [同行] {info.get('申万二级') or board['board_name']} → {len(peers)} 家")
     return info, peers
+
+
+def _akshare_market_symbol(code: str) -> str:
+    """Return the market-prefixed code required by EastMoney peer endpoints."""
+    normalized = str(code).zfill(6)
+    market = "SH" if normalized.startswith(("6", "9")) else "BJ" if normalized.startswith(("4", "8")) else "SZ"
+    return f"{market}{normalized}"
+
+
+def _comparison_code(value: object) -> str:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    return digits[-6:] if len(digits) >= 6 else ""
+
+
+def _comparison_value(value: object) -> object:
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(number):
+        return float(number)
+    text = str(value).strip()
+    return text or None
+
+
+PEER_COMPARISON_FIELDS = {
+    "scale": {
+        "总市值排名": "market_cap_rank",
+        "流通市值排名": "float_market_cap_rank",
+        "营业收入排名": "revenue_rank",
+        "净利润排名": "net_profit_rank",
+    },
+    "growth": {
+        "基本每股收益增长率-3年复合": "eps_growth_3y",
+        "基本每股收益增长率-TTM": "eps_growth_ttm",
+        "基本每股收益增长率-3年复合排名": "eps_growth_3y_rank",
+        "营业收入增长率-3年复合": "revenue_growth_3y",
+        "营业收入增长率-TTM": "revenue_growth_ttm",
+        "净利润增长率-3年复合": "net_profit_growth_3y",
+        "净利润增长率-TTM": "net_profit_growth_ttm",
+    },
+    "dupont": {
+        "ROE-3年平均": "roe_3y_avg",
+        "ROE-3年平均排名": "roe_3y_rank",
+        "净利率-3年平均": "net_margin_3y_avg",
+        "总资产周转率-3年平均": "asset_turnover_3y_avg",
+        "权益乘数-3年平均": "equity_multiplier_3y_avg",
+    },
+    "valuation": {
+        "排名": "valuation_rank",
+        "市盈率-TTM": "pe_ttm",
+        "市净率-MRQ": "pb_mrq",
+        "PEG": "peg",
+        "市销率-TTM": "ps_ttm",
+    },
+}
+
+
+def _comparison_metric_subset(row: pd.Series, comparison: str) -> dict[str, object]:
+    fields = PEER_COMPARISON_FIELDS.get(comparison, {})
+    result = {
+        target: value
+        for source, target in fields.items()
+        if (value := _comparison_value(row.get(source))) is not None
+    }
+    return result
+
+
+def _comparison_status(results: dict[str, object]) -> str:
+    states = [str(getattr(result, "fetch_state", "failed")) for result in results.values()]
+    if any(state == "ok" for state in states):
+        return "ok"
+    if states and all(state == "empty" for state in states):
+        return "empty"
+    return "failed"
+
+
+def fetch_industry_peer_snapshot(
+    code: str,
+    timeout: int = 8,
+    comparisons: tuple[str, ...] = ("scale", "growth", "valuation", "dupont"),
+) -> dict:
+    """Fetch B-tier EastMoney peer snapshots without redefining direct peers.
+
+    The scale endpoint intentionally returns only the target row and its
+    industry ranks.  The growth, valuation and DuPont endpoints return a small
+    ranked sample plus industry average/median; those rows are useful for
+    screening but are *not* a verified peer universe.
+    """
+    symbol = _akshare_market_symbol(code)
+    available_endpoints = {
+        "scale": ak.stock_zh_scale_comparison_em,
+        "growth": ak.stock_zh_growth_comparison_em,
+        "valuation": ak.stock_zh_valuation_comparison_em,
+        "dupont": ak.stock_zh_dupont_comparison_em,
+    }
+    requested = tuple(dict.fromkeys(comparisons))
+    invalid = [item for item in requested if item not in available_endpoints]
+    if invalid:
+        raise ValueError(f"未知同行比较类型：{'、'.join(invalid)}")
+    endpoints = {kind: available_endpoints[kind] for kind in requested}
+    if not endpoints:
+        raise ValueError("至少需要一个同行比较类型")
+
+    def fetch(kind: str, function) -> object:
+        return run_with_timeout(
+            f"AKShare同行比较/{kind}",
+            lambda: function(symbol=symbol),
+            seconds=timeout,
+            source="AKShare/东方财富同行比较",
+            empty=dataframe_empty,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+        futures = {kind: executor.submit(fetch, kind, function) for kind, function in endpoints.items()}
+        results = {kind: future.result() for kind, future in futures.items()}
+
+    frames = {
+        kind: result.value if result.ok and isinstance(result.value, pd.DataFrame) else pd.DataFrame()
+        for kind, result in results.items()
+    }
+    target: dict[str, object] = {"code": str(code).zfill(6)}
+    benchmarks: dict[str, dict[str, dict[str, object]]] = {}
+    samples: dict[str, dict[str, object]] = {}
+    for kind, frame in frames.items():
+        if frame.empty or "代码" not in frame.columns:
+            continue
+        for _, row in frame.iterrows():
+            raw_code = str(row.get("代码") or "").strip()
+            normalized_code = _comparison_code(raw_code)
+            metrics = _comparison_metric_subset(row, kind)
+            if normalized_code == str(code).zfill(6):
+                target.update(metrics)
+                target.setdefault("name", str(row.get("简称") or ""))
+                continue
+            if raw_code in {"行业平均", "行业中值"}:
+                benchmarks.setdefault(kind, {})[raw_code] = metrics
+                continue
+            if not normalized_code:
+                continue
+            sample = samples.setdefault(
+                normalized_code,
+                {
+                    "code": normalized_code,
+                    "name": str(row.get("简称") or normalized_code),
+                    "status": "行业指标样本，需主营与产业链位置确认",
+                    "source": "AKShare/东方财富同行比较（B级；非完整同行池）",
+                },
+            )
+            sample.update(metrics)
+
+    status = _comparison_status(results)
+    source_chain = {
+        kind: {
+            "fetch_state": result.fetch_state,
+            "source_chain": result.source_chain or [],
+            "error": result.error or None,
+        }
+        for kind, result in results.items()
+    }
+    return {
+        "status": "已获取" if status == "ok" and len(target) > 1 else "需人工确认",
+        "fetch_state": status,
+        "source": "AKShare/东方财富同行比较",
+        "source_tier": "B",
+        "scope": "行业横截面排名、均值/中值和少量排序样本；不等于申万完整成分或已验证直接同行",
+        "symbol": symbol,
+        "target": target,
+        "industry_benchmarks": benchmarks,
+        "peer_samples": list(samples.values()),
+        "source_chain": source_chain,
+    }
+
+
+def _enrich_direct_peers_with_snapshot(rows: list[dict], snapshot: dict | None) -> list[dict]:
+    if not rows or not isinstance(snapshot, dict) or snapshot.get("fetch_state") != "ok":
+        return rows
+    sample_map = {
+        str(item.get("code") or "").zfill(6): item
+        for item in snapshot.get("peer_samples", [])
+        if isinstance(item, dict)
+    }
+    for row in rows:
+        metrics = sample_map.get(str(row.get("code") or "").zfill(6))
+        if not metrics:
+            continue
+        row["industry_snapshot_metrics"] = {
+            key: value
+            for key, value in metrics.items()
+            if key not in {"code", "name", "status", "source"}
+        }
+        row["industry_snapshot_source"] = metrics.get("source")
+    return rows
 
 
 def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
@@ -292,7 +545,7 @@ def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
 
     def easy_sina() -> pd.DataFrame:
         from tools.providers.easy_tdx_provider import fetch_financial_report as fetch_sina_report
-        return _financial_aliases(fetch_sina_report(code, report_type, num=8))
+        return _financial_aliases(fetch_sina_report(code, report_type, num=20))
 
     def ak_sina() -> pd.DataFrame:
         prefix = "sh" if code.startswith(("6", "9")) else "bj" if code.startswith(("4", "8")) else "sz"
@@ -307,7 +560,7 @@ def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
         function = functions.get(report_type)
         if function is None:
             return pd.DataFrame()
-        return _normalize_ths_financial_report(function(symbol=code, indicator="按报告期"), report_type).head(8)
+        return _normalize_ths_financial_report(function(symbol=code, indicator="按报告期"), report_type).head(20)
 
     result = run_fallback_chain(
         f"财报/{report_type}",
@@ -321,16 +574,79 @@ def fetch_financial_report(code: str, report_type: str) -> pd.DataFrame:
     return _with_frame_meta(frame, fetch_state=result.fetch_state, source_chain=result.source_chain, error=result.error)
 
 
+def fetch_baostock_financial_summary(code: str) -> pd.DataFrame:
+    """Fetch B-tier summary metrics for cross-checking and limited last-resort filling."""
+    def baostock() -> pd.DataFrame:
+        from tools.providers.baostock_provider import fetch_financial_summary
+
+        return fetch_financial_summary(code)
+
+    result = run_fallback_chain(
+        "BaoStock财务摘要",
+        [("BaoStock/B级财务摘要", baostock)],
+        seconds=15,
+        empty=dataframe_empty,
+    )
+    frame = result.value if isinstance(result.value, pd.DataFrame) else pd.DataFrame()
+    frame = _with_frame_meta(
+        frame,
+        fetch_state=result.fetch_state,
+        source_chain=result.source_chain,
+        error=result.error,
+    )
+    frame.attrs.update({
+        "source_tier": "B",
+        "evidence_role": "cross_check_and_partial_fallback",
+    })
+    return frame
+
+
+def _normalize_valuation_history(frame: pd.DataFrame, column: str, source: str) -> pd.DataFrame:
+    if frame is None or frame.empty or column not in frame.columns:
+        return pd.DataFrame(columns=["date", "value"])
+    date_column = next((item for item in ("数据日期", "date", "日期") if item in frame.columns), None)
+    if date_column is None:
+        return pd.DataFrame(columns=["date", "value"])
+    result = frame[[date_column, column]].rename(columns={date_column: "date", column: "value"}).copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    result["value"] = pd.to_numeric(result["value"], errors="coerce")
+    result = result.dropna(subset=["date", "value"]).sort_values("date").drop_duplicates("date", keep="last")
+    result.attrs["source"] = source
+    return result.reset_index(drop=True)
+
+
 def fetch_historical_valuation(code: str) -> dict[str, pd.DataFrame]:
-    """Five-year PE/PB history for individual valuation percentiles."""
+    """Multi-source valuation history plus share-capital details."""
     results: dict[str, pd.DataFrame] = {}
-    for key, indicator in (("pe", "市盈率(TTM)"), ("pb", "市净率")):
-        try:
-            frame = ak.stock_zh_valuation_baidu(symbol=code, indicator=indicator, period="近五年")
-            if frame is not None and not frame.empty:
-                results[key] = frame
-        except Exception as exc:
-            print(f"  [历史估值/{indicator}] 失败: {exc}")
+    eastmoney = pd.DataFrame()
+    eastmoney_error = ""
+    try:
+        eastmoney = ak.stock_value_em(symbol=code)
+        if eastmoney is not None and not eastmoney.empty:
+            cutoff = pd.Timestamp.now().normalize() - pd.DateOffset(years=5)
+            dates = pd.to_datetime(eastmoney.get("数据日期"), errors="coerce")
+            eastmoney = eastmoney.loc[dates.ge(cutoff)].copy()
+            eastmoney.attrs["source"] = "AKShare/东方财富估值分析"
+            results["capital"] = eastmoney
+    except Exception as exc:
+        eastmoney_error = f"{type(exc).__name__}: {exc}"
+
+    for key, indicator, em_column in (("pe", "市盈率(TTM)", "PE(TTM)"), ("pb", "市净率", "市净率")):
+        primary = _normalize_valuation_history(eastmoney, em_column, "AKShare/东方财富估值分析")
+        chain = [{"source": "AKShare/东方财富估值分析", "status": "ok" if not primary.empty else "failed", "error": eastmoney_error}]
+        frame = primary
+        if frame.empty:
+            try:
+                fallback = ak.stock_zh_valuation_baidu(symbol=code, indicator=indicator, period="近五年")
+                frame = _normalize_valuation_history(fallback, "value", "AKShare/百度估值")
+                chain.append({"source": "AKShare/百度估值", "status": "ok" if not frame.empty else "empty", "error": ""})
+            except Exception as exc:
+                chain.append({"source": "AKShare/百度估值", "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        if not frame.empty:
+            frame.attrs["source_chain"] = chain
+            results[key] = frame
+        else:
+            print(f"  [历史估值/{indicator}] 失败: {chain[-1]['error'] or 'empty'}")
     return results
 
 
@@ -354,6 +670,145 @@ def _history_median_ratio(frame: pd.DataFrame) -> float | None:
     return float(values.iloc[-1]) / median if median > 0 else None
 
 
+def _history_quantiles(frame: pd.DataFrame, minimum: int = 250) -> dict[str, float] | None:
+    if frame is None or frame.empty or "value" not in frame.columns:
+        return None
+    values = pd.to_numeric(frame["value"], errors="coerce").dropna()
+    values = values[values > 0]
+    if len(values) < minimum:
+        return None
+    return {
+        "q20": float(values.quantile(0.20)),
+        "q50": float(values.quantile(0.50)),
+        "q80": float(values.quantile(0.80)),
+        "samples": int(len(values)),
+    }
+
+
+def _business_signature(structured: dict) -> set[str]:
+    text = "".join(str(item) for item in structured.get("business_items") or [])
+    text = "".join(character for character in text if "\u4e00" <= character <= "\u9fff")
+    return {text[index:index + 2] for index in range(max(0, len(text) - 1))}
+
+
+def _business_similarity(left: dict, right: dict) -> float:
+    left_signature, right_signature = _business_signature(left), _business_signature(right)
+    if not left_signature or not right_signature:
+        return 0.0
+    return len(left_signature & right_signature) / len(left_signature | right_signature)
+
+
+CHAIN_POSITION_KEYWORDS = {
+    "设备": ("设备", "仪器", "机器", "系统", "平台", "产线"),
+    "零部件/材料": ("零部件", "组件", "部件", "材料", "芯片", "模组", "器件"),
+    "耗材/试剂": ("耗材", "试剂", "试剂盒", "药盒"),
+    "软件/服务": ("软件", "服务", "检测", "诊断", "运营", "维护"),
+    "产品": ("药品", "制剂", "食品", "整车", "电池", "产品"),
+}
+
+
+def _chain_positions(structured: dict) -> set[str]:
+    text = "".join(str(item) for item in structured.get("business_items") or [])
+    return {
+        position
+        for position, keywords in CHAIN_POSITION_KEYWORDS.items()
+        if any(keyword in text for keyword in keywords)
+    }
+
+
+def _latest_peer_metric(frame: pd.DataFrame, *columns: str) -> float | None:
+    column = next((item for item in columns if item in frame.columns), None)
+    if frame.empty or column is None:
+        return None
+    value = pd.to_numeric(pd.Series([frame.iloc[0][column]]), errors="coerce").iloc[0]
+    return None if pd.isna(value) else float(value)
+
+
+def collect_direct_peers(code: str, valuation: pd.DataFrame, maximum: int = 3) -> list[dict]:
+    """Confirm direct peers with product overlap, then collect comparable facts."""
+    if valuation.empty or "代码" not in valuation.columns or valuation.attrs.get("peer_scope_status") != "已验证":
+        return []
+    normalized_codes = valuation["代码"].astype(str).str.zfill(6)
+    candidate_rows = valuation.loc[~normalized_codes.eq(code)].head(8)
+    candidate_codes = [str(item).zfill(6) for item in candidate_rows["代码"].tolist()]
+    try:
+        with ThreadPoolExecutor(max_workers=min(7, len(candidate_codes) + 1)) as executor:
+            business_futures = {
+                peer_code: executor.submit(fetch_business_data, peer_code, 10)
+                for peer_code in [code, *candidate_codes]
+            }
+            business = {
+                peer_code: build_business_structured(future.result())
+                for peer_code, future in business_futures.items()
+            }
+    except Exception as exc:
+        print(f"  [直接同行] 主营确认失败: {type(exc).__name__}: {exc}")
+        return []
+
+    target_positions = _chain_positions(business.get(code, {}))
+    ranked = sorted(
+        (
+            (
+                peer_code,
+                _business_similarity(business.get(code, {}), business.get(peer_code, {})),
+                _chain_positions(business.get(peer_code, {})),
+            )
+            for peer_code in candidate_codes
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    selected = [
+        (peer_code, similarity, positions)
+        for peer_code, similarity, positions in ranked
+        if similarity >= 0.12 and target_positions and target_positions & positions
+    ][:maximum]
+    if not selected:
+        return []
+
+    financials: dict[str, dict[str, pd.DataFrame]] = {peer_code: {} for peer_code, _, _ in selected}
+    try:
+        with ThreadPoolExecutor(max_workers=len(selected) * 3) as executor:
+            futures = {
+                (peer_code, report_type): executor.submit(fetch_financial_report, peer_code, report_type)
+                for peer_code, _, _ in selected for report_type in ("lrb", "fzb", "llb")
+            }
+            for (peer_code, report_type), future in futures.items():
+                financials[peer_code][report_type] = future.result()
+    except Exception as exc:
+        print(f"  [直接同行] 财务确认部分失败: {type(exc).__name__}: {exc}")
+
+    rows: list[dict] = []
+    for peer_code, similarity, positions in selected:
+        valuation_row = candidate_rows[candidate_rows["代码"].astype(str).str.zfill(6).eq(peer_code)]
+        item = valuation_row.iloc[0] if not valuation_row.empty else pd.Series(dtype=object)
+        peer_finance = financials.get(peer_code, {})
+        income, cashflow = peer_finance.get("lrb", pd.DataFrame()), peer_finance.get("llb", pd.DataFrame())
+        breakdown = business.get(peer_code, {}).get("business_breakdown") or []
+        margins = [row.get("gross_margin") for row in breakdown if isinstance(row, dict) and row.get("gross_margin") is not None]
+        verified = business.get(peer_code, {}).get("fetch_state") in {"ok", "fallback_ok"} and not income.empty
+        rows.append({
+            "code": peer_code,
+            "name": str(item.get("简称") or peer_code),
+            "business_similarity": round(similarity, 4),
+            "main_business": business.get(peer_code, {}).get("main_business", "需人工确认"),
+            "chain_positions": sorted(positions),
+            "chain_position_match": sorted(target_positions & positions),
+            "revenue": _latest_peer_metric(income, "营业收入"),
+            "revenue_yoy": _latest_peer_metric(income, "营业收入_同比"),
+            "net_profit": _latest_peer_metric(income, "归属于母公司的净利润", "归属于母公司所有者的净利润"),
+            "profit_yoy": _latest_peer_metric(income, "归属于母公司的净利润_同比", "归属于母公司所有者的净利润_同比"),
+            "operating_cashflow": _latest_peer_metric(cashflow, "经营活动产生的现金流量净额"),
+            "gross_margin": max(margins) if margins else None,
+            "pe_ttm": None if pd.isna(item.get("市盈率-TTM")) else float(item.get("市盈率-TTM")),
+            "pb": None if pd.isna(item.get("市净率")) else float(item.get("市净率")),
+            "status": "已验证" if verified else "需人工确认",
+            "industry_scope": valuation.attrs.get("sw_second_name"),
+            "source": "申万二级成分股 + 主营关键词 + 产业链位置 + 公开财报",
+        })
+    return rows
+
+
 # ══════════════════════════════════════════════════════
 #  Report Generator
 # ══════════════════════════════════════════════════════
@@ -367,9 +822,118 @@ def _safe_num(v, fmt=".2f"):
     return str(v)
 
 
+def _statement_period(frame: pd.DataFrame) -> pd.Timestamp | None:
+    if frame is None or frame.empty or "报告期" not in frame.columns:
+        return None
+    value = pd.to_datetime(frame.iloc[0].get("报告期"), errors="coerce")
+    return None if pd.isna(value) else pd.Timestamp(value).normalize()
+
+
+def _summary_number(row: pd.Series, column: str) -> float | None:
+    value = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
+    return None if pd.isna(value) else float(value)
+
+
+def _apply_baostock_summary(
+    metrics: dict,
+    financials: dict[str, pd.DataFrame],
+    summary: pd.DataFrame,
+) -> None:
+    """Cross-check matching periods and fill only fields absent from full statements."""
+    if summary is None or summary.empty:
+        return
+    ordered = summary.copy()
+    ordered["statDate"] = pd.to_datetime(ordered.get("statDate"), errors="coerce")
+    ordered = ordered.dropna(subset=["statDate"]).sort_values("statDate", ascending=False)
+    if ordered.empty:
+        return
+    latest_row = ordered.iloc[0]
+    latest_date = pd.Timestamp(latest_row["statDate"]).normalize()
+    source = "BaoStock/B级财务摘要"
+    overrides = metrics.setdefault("metric_source_overrides", {})
+    fallback_fields: list[str] = []
+    for target, source_column, report_type in (
+        ("net_profit", "netProfit", "lrb"),
+        ("debt_ratio", "liabilityToAsset", "fzb"),
+        ("operating_cashflow_to_net_profit", "CFOToNP", "llb"),
+        ("total_shares", "totalShare", None),
+        ("float_shares", "liqaShare", None),
+    ):
+        value = _summary_number(latest_row, source_column)
+        primary_period = _statement_period(financials.get(report_type, pd.DataFrame())) if report_type else None
+        period_compatible = primary_period is None or primary_period == latest_date
+        if metrics.get(target) is None and value is not None and period_compatible:
+            metrics[target] = value
+            overrides[target] = f"{source}（末级部分补缺）"
+            fallback_fields.append(target)
+
+    comparisons: dict[str, dict] = {}
+    specs = (
+        ("net_profit", "netProfit", "lrb"),
+        ("debt_ratio", "liabilityToAsset", "fzb"),
+        ("operating_cashflow_to_net_profit", "CFOToNP", "llb"),
+    )
+    for metric_key, source_column, report_type in specs:
+        primary_period = _statement_period(financials.get(report_type, pd.DataFrame()))
+        if primary_period is None:
+            continue
+        if metric_key == "operating_cashflow_to_net_profit":
+            income_period = _statement_period(financials.get("lrb", pd.DataFrame()))
+            if income_period is not None and income_period != primary_period:
+                comparisons[metric_key] = {
+                    "status": "period_mismatch",
+                    "income_period": income_period.date().isoformat(),
+                    "cash_flow_period": primary_period.date().isoformat(),
+                }
+                continue
+        match = ordered[ordered["statDate"].dt.normalize().eq(primary_period)]
+        if match.empty:
+            comparisons[metric_key] = {
+                "status": "period_mismatch",
+                "primary_period": primary_period.date().isoformat(),
+                "baostock_latest_period": latest_date.date().isoformat(),
+            }
+            continue
+        primary_value = metrics.get(metric_key)
+        bao_value = _summary_number(match.iloc[0], source_column)
+        if primary_value is None or bao_value is None:
+            continue
+        difference = abs(float(primary_value) - bao_value) / max(abs(float(primary_value)), 1e-12)
+        comparisons[metric_key] = {
+            "status": "matched" if difference <= 0.05 else "mismatch",
+            "primary": float(primary_value),
+            "baostock": bao_value,
+            "relative_difference": difference,
+            "stat_date": primary_period.date().isoformat(),
+        }
+
+    comparison_states = {item.get("status") for item in comparisons.values()}
+    status = (
+        "mismatch" if "mismatch" in comparison_states
+        else "matched" if "matched" in comparison_states
+        else "partial_fallback" if fallback_fields
+        else "period_mismatch" if "period_mismatch" in comparison_states
+        else "available"
+    )
+    pub_date = pd.to_datetime(latest_row.get("pubDate"), errors="coerce")
+    metrics["baostock_financial_crosscheck"] = {
+        "status": status,
+        "source": source,
+        "source_tier": "B",
+        "role": "cross_check_and_partial_fallback",
+        "latest_stat_date": latest_date.date().isoformat(),
+        "latest_pub_date": "" if pd.isna(pub_date) else pd.Timestamp(pub_date).date().isoformat(),
+        "fallback_fields": fallback_fields,
+        "comparisons": comparisons,
+    }
+
+
 def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame,
                     valuation: pd.DataFrame, financials: dict[str, pd.DataFrame],
-                    valuation_history: dict[str, pd.DataFrame] | None = None) -> dict:
+                    valuation_history: dict[str, pd.DataFrame] | None = None,
+                    direct_peers: list[dict] | None = None,
+                    baostock_summary: pd.DataFrame | None = None,
+                    industry_peer_snapshot: dict | None = None) -> dict:
     def latest(report_type: str, *columns: str):
         frame = financials.get(report_type, pd.DataFrame())
         column = next((candidate for candidate in columns if candidate in frame.columns), None)
@@ -397,13 +961,29 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
         "quote_source_chain": spot.get("_source_chain", []) if spot else [],
         "kline_fetch_state": kline_daily.attrs.get("fetch_state", "failed"),
         "kline_source_chain": kline_daily.attrs.get("source_chain", []),
+        "kline_quality_issues": kline_daily.attrs.get("quality_issues", []),
         "financial_fetch_state": {
             key: frame.attrs.get("fetch_state", "failed") for key, frame in financials.items()
         },
         "financial_source_chain": {
             key: frame.attrs.get("source_chain", []) for key, frame in financials.items()
         },
+        "baostock_financial_fetch_state": (
+            baostock_summary.attrs.get("fetch_state", "failed")
+            if isinstance(baostock_summary, pd.DataFrame) else "failed"
+        ),
+        "baostock_financial_source_chain": (
+            baostock_summary.attrs.get("source_chain", [])
+            if isinstance(baostock_summary, pd.DataFrame) else []
+        ),
     }
+    if direct_peers:
+        metrics["peer_comparison"] = direct_peers
+    if isinstance(industry_peer_snapshot, dict):
+        metrics["industry_peer_snapshot"] = industry_peer_snapshot
+        metrics.setdefault("metric_source_overrides", {})["industry_peer_snapshot"] = (
+            "AKShare/东方财富同行比较"
+        )
     income = financials.get("lrb", pd.DataFrame())
     if len(income) >= 2:
         for columns, target in (
@@ -447,14 +1027,27 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
         metrics["debt_ratio"] = liabilities / assets
     if cash is not None and liabilities and liabilities > 0:
         metrics["cash_to_debt"] = cash / liabilities
-    if cash is not None and assets and assets > 0 and interest_debt is not None:
-        metrics["net_cash_ratio"] = (cash - interest_debt) / assets
+    if cash is not None and interest_debt is not None:
+        metrics["net_debt"] = interest_debt - cash
+        if assets and assets > 0:
+            metrics["net_cash_ratio"] = (cash - interest_debt) / assets
     if cash is not None and short_debt is not None:
         metrics["cash_to_short_debt"] = cash / short_debt if short_debt > 0 else 999.0
     operating_cashflow = metrics.get("operating_cashflow")
     net_profit = metrics.get("net_profit")
+    capex_cash_paid = latest(
+        "llb",
+        "购建固定资产、无形资产和其他长期资产支付的现金",
+        "购建固定资产、无形资产和其他长期资产所支付的现金",
+    )
+    if capex_cash_paid is not None:
+        metrics["capex_cash_paid"] = capex_cash_paid
+    if operating_cashflow is not None and capex_cash_paid is not None:
+        metrics["free_cash_flow"] = operating_cashflow - capex_cash_paid
     if operating_cashflow is not None and net_profit is not None and net_profit > 0:
         metrics["operating_cashflow_to_net_profit"] = operating_cashflow / net_profit
+        if metrics.get("free_cash_flow") is not None:
+            metrics["free_cash_flow_to_net_profit"] = metrics["free_cash_flow"] / net_profit
     if receivables is not None and assets and assets > 0:
         metrics["receivables_to_assets"] = receivables / assets
     goodwill = latest("fzb", "商誉")
@@ -476,29 +1069,108 @@ def _report_metrics(code: str, spot: dict, info: dict, kline_daily: pd.DataFrame
         peers = peers[peers > 0]
         if not peers.empty:
             metrics["peer_pe_ttm_median"] = float(peers.median())
+        peer_candidates = []
+        for _, row in valuation.loc[~valuation["代码"].eq(code)].head(8).iterrows():
+            peer_candidates.append({
+                "code": str(row.get("代码") or "").zfill(6),
+                "name": str(row.get("简称") or "同行候选"),
+                "pe_ttm": None if pd.isna(row.get("市盈率-TTM")) else float(row.get("市盈率-TTM")),
+                "pb": None if pd.isna(row.get("市净率")) else float(row.get("市净率")),
+                "market_cap": None if pd.isna(row.get("总市值")) else float(row.get("总市值")),
+                "eps": None if pd.isna(row.get("每股收益")) else float(row.get("每股收益")),
+                "status": "行业候选，需主营与产业链位置确认",
+                "source": "同一行业板块结构化行情",
+            })
+        if peer_candidates:
+            metrics["peer_candidates"] = peer_candidates
     valuation_history = valuation_history or {}
+    capital = valuation_history.get("capital", pd.DataFrame())
+    if not capital.empty:
+        latest_capital = capital.sort_values("数据日期").iloc[-1]
+        for column, key in (
+            ("总股本", "total_shares"),
+            ("流通股本", "float_shares"),
+            ("总市值", "market_cap"),
+            ("流通市值", "float_market_cap"),
+        ):
+            value = pd.to_numeric(pd.Series([latest_capital.get(column)]), errors="coerce").iloc[0]
+            if pd.notna(value):
+                metrics[key] = float(value)
+    if isinstance(baostock_summary, pd.DataFrame):
+        _apply_baostock_summary(metrics, financials, baostock_summary)
+    metrics["valuation_history_source_chain"] = {
+        key: frame.attrs.get("source_chain", []) for key, frame in valuation_history.items() if key in {"pe", "pb"}
+    }
     pe_percentile = _history_percentile(valuation_history.get("pe", pd.DataFrame()))
     pb_percentile = _history_percentile(valuation_history.get("pb", pd.DataFrame()))
     pb_median_ratio = _history_median_ratio(valuation_history.get("pb", pd.DataFrame()))
+    pe_quantiles = _history_quantiles(valuation_history.get("pe", pd.DataFrame()))
+    pb_quantiles = _history_quantiles(valuation_history.get("pb", pd.DataFrame()))
     if pe_percentile is not None:
         metrics["pe_percentile_5y"] = pe_percentile
     if pb_percentile is not None:
         metrics["pb_percentile_5y"] = pb_percentile
     if pb_median_ratio is not None:
         metrics["pb_to_5y_median"] = pb_median_ratio
+    if pe_quantiles is not None:
+        metrics["pe_history_quantiles_5y"] = pe_quantiles
+    if pb_quantiles is not None:
+        metrics["pb_history_quantiles_5y"] = pb_quantiles
+    kline_consistent = True
     if not kline_daily.empty and "close" in kline_daily.columns:
+        latest_kline = pd.to_numeric(pd.Series([kline_daily.iloc[-1].get("close")]), errors="coerce").iloc[0]
+        latest_quote = pd.to_numeric(pd.Series([spot.get("最新价") if spot else None]), errors="coerce").iloc[0]
+        if pd.notna(latest_kline):
+            metrics["kline_latest_close"] = float(latest_kline)
+        if pd.notna(latest_kline) and pd.notna(latest_quote) and latest_quote > 0:
+            deviation = abs(float(latest_kline) / float(latest_quote) - 1)
+            metrics["kline_quote_deviation"] = deviation
+            if deviation > 0.10:
+                kline_consistent = False
+                metrics["kline_sanity_status"] = "warning"
+                metrics["kline_sanity_reason"] = "日K末值与实时行情偏差超过10%，价格分位不参与判断"
+            else:
+                metrics["kline_sanity_status"] = "ok"
+    if kline_consistent and not kline_daily.empty and "close" in kline_daily.columns:
         close = pd.to_numeric(kline_daily["close"], errors="coerce").dropna().tail(800)
         if len(close) >= 720:
             latest_close, low, high = float(close.iloc[-1]), float(close.min()), float(close.max())
             if high > low:
                 metrics["price_percentile_3y"] = (latest_close - low) / (high - low)
                 metrics["drawdown_from_3y_high"] = latest_close / high - 1
+                metrics["price_history_quantiles_3y"] = {
+                    "q20": float(close.quantile(0.20)),
+                    "q50": float(close.quantile(0.50)),
+                    "q80": float(close.quantile(0.80)),
+                    "samples": int(len(close)),
+                }
+    kline_sources = {
+        str(item.get("source") or "")
+        for item in metrics.get("kline_source_chain", [])
+        if item.get("status") == "ok"
+    }
+    if "BaoStock" in kline_sources:
+        overrides = metrics.setdefault("metric_source_overrides", {})
+        for key in (
+            "kline_latest_close",
+            "kline_quote_deviation",
+            "price_percentile_3y",
+            "drawdown_from_3y_high",
+            "price_history_quantiles_3y",
+        ):
+            if key in metrics:
+                overrides[key] = "BaoStock/B级行情"
     states = [metrics.get("quote_fetch_state"), metrics.get("kline_fetch_state"), *metrics.get("financial_fetch_state", {}).values()]
     metrics["fetch_state"] = "failed" if any(state == "failed" for state in states) else "fallback_ok" if any(state == "fallback_ok" for state in states) else "empty" if all(state in {"empty", "failed"} for state in states) else "ok"
     metrics["source_chain"] = {
         "quote": metrics.get("quote_source_chain", []),
         "kline": metrics.get("kline_source_chain", []),
         "financial": metrics.get("financial_source_chain", {}),
+        "baostock_financial_summary": metrics.get("baostock_financial_source_chain", []),
+        "industry_peer_snapshot": (
+            metrics.get("industry_peer_snapshot", {}).get("source_chain", {})
+            if isinstance(metrics.get("industry_peer_snapshot"), dict) else {}
+        ),
     }
     clean: dict = {}
     for key, value in metrics.items():
@@ -520,18 +1192,33 @@ def build_report(code: str, name: str,
                  kline_quarterly: pd.DataFrame,
                  valuation: pd.DataFrame,
                  financials: dict[str, pd.DataFrame],
-                 valuation_history: dict[str, pd.DataFrame] | None = None) -> str:
+                 valuation_history: dict[str, pd.DataFrame] | None = None,
+                 direct_peers: list[dict] | None = None,
+                 baostock_summary: pd.DataFrame | None = None,
+                 industry_peer_snapshot: dict | None = None) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    metrics = _report_metrics(
+        code,
+        spot,
+        info,
+        kline_daily,
+        valuation,
+        financials,
+        valuation_history,
+        direct_peers,
+        baostock_summary,
+        industry_peer_snapshot,
+    )
     L = [
         f"# 基本面+行情报告: {name}({code})",
         f"",
-        f"> 采集时间: {ts}  |  数据源: easy_tdx/TDX/Sina + efinance/AKShare + Tencent",
+        f"> 采集时间: {ts}  |  数据源: easy_tdx/TDX/Sina + BaoStock + efinance/AKShare + Tencent",
         f"> 雪球: [个股页](https://xueqiu.com/S/{'SH' if code[0]=='6' else 'SZ'}{code})  "
         f"|  东财: [股吧](https://guba.eastmoney.com/list,{code},99,f.html)",
         f"",
         "---",
     ]
-    L.append(f"<!-- moda_metrics: {json.dumps(_report_metrics(code, spot, info, kline_daily, valuation, financials, valuation_history), ensure_ascii=False)} -->")
+    L.append(f"<!-- moda_metrics: {json.dumps(metrics, ensure_ascii=False)} -->")
 
     # ── 1. 实时行情 ──
     L += ["## 1. 实时行情", ""]
@@ -598,6 +1285,24 @@ def build_report(code: str, name: str,
                     values.append(_safe_num(value))
             L.append("| " + " | ".join(values) + " |")
         L.append("")
+
+    L += ["### BaoStock 财务摘要交叉验证", ""]
+    if isinstance(baostock_summary, pd.DataFrame) and not baostock_summary.empty:
+        L += ["*来源: BaoStock（B级聚合；仅交叉验证和末级部分补缺，不替代完整三表）*  ", ""]
+        summary_columns = [
+            column for column in (
+                "statDate", "pubDate", "netProfit", "roeAvg", "gpMargin",
+                "liabilityToAsset", "CFOToNP", "totalShare", "liqaShare",
+            ) if column in baostock_summary.columns
+        ]
+        L.append("| " + " | ".join(summary_columns) + " |")
+        L.append("|" + "|".join(["------"] * len(summary_columns)) + "|")
+        for _, row in baostock_summary.head(4).iterrows():
+            L.append("| " + " | ".join(_safe_num(row.get(column)) for column in summary_columns) + " |")
+        crosscheck = metrics.get("baostock_financial_crosscheck", {})
+        L += ["", f"交叉验证状态：{crosscheck.get('status', 'available')}。", ""]
+    else:
+        L += ["⚠️ 无可用数据；不影响完整三表的既有采集状态。", ""]
 
     # ── 4. 近期行情 ──
     L += ["## 4. 近期行情 (日K)", ""]
@@ -673,6 +1378,52 @@ def build_report(code: str, name: str,
     else:
         L.append("⚠️ 无同行估值数据")
     L.append("")
+    L += ["### 已确认直接同行", "", "| 公司 | 主营相似度 | 营收同比 | 利润同比 | 经营现金流 | 状态 |", "|---|---:|---:|---:|---:|---|"]
+    for peer in direct_peers or []:
+        L.append(f"| {peer.get('name')} | {_safe_num(peer.get('business_similarity'))} | {_safe_num(peer.get('revenue_yoy'))} | {_safe_num(peer.get('profit_yoy'))} | {_safe_num(peer.get('operating_cashflow'))} | {peer.get('status')} |")
+    if not direct_peers:
+        L.append("| 需人工确认 | - | - | - | - | 未取得主营与产业链位置均匹配的直接同行 |")
+    L.append("")
+    snapshot = metrics.get("industry_peer_snapshot") if isinstance(metrics.get("industry_peer_snapshot"), dict) else {}
+    L += ["### AKShare/东方财富行业横截面快照", ""]
+    if snapshot.get("fetch_state") == "ok" and isinstance(snapshot.get("target"), dict):
+        target = snapshot["target"]
+        ranks = [
+            ("总市值行业排名", target.get("market_cap_rank")),
+            ("流通市值行业排名", target.get("float_market_cap_rank")),
+            ("营收行业排名", target.get("revenue_rank")),
+            ("净利润行业排名", target.get("net_profit_rank")),
+            ("ROE-3年平均排名", target.get("roe_3y_rank")),
+            ("EPS增长3年复合排名", target.get("eps_growth_3y_rank")),
+        ]
+        L += [
+            "*B级横截面数据，仅用于相对位置与轻量候选排序；不替代申万成分、主营和产业链位置的直接同行核验。*  ",
+            "",
+            "| 指标 | 行业排名 |",
+            "|---|---:|",
+        ]
+        for label, value in ranks:
+            if value is not None:
+                L.append(f"| {label} | {_safe_num(value)} |")
+        benchmarks = snapshot.get("industry_benchmarks") if isinstance(snapshot.get("industry_benchmarks"), dict) else {}
+        growth_median = benchmarks.get("growth", {}).get("行业中值", {}) if isinstance(benchmarks.get("growth"), dict) else {}
+        dupont_median = benchmarks.get("dupont", {}).get("行业中值", {}) if isinstance(benchmarks.get("dupont"), dict) else {}
+        if growth_median or dupont_median:
+            L += [
+                "",
+                "| 行业中值（可用字段） | 数值 |",
+                "|---|---:|",
+            ]
+            for label, value in (
+                ("营收增长TTM", growth_median.get("revenue_growth_ttm")),
+                ("净利润增长TTM", growth_median.get("net_profit_growth_ttm")),
+                ("ROE-3年平均", dupont_median.get("roe_3y_avg")),
+            ):
+                if value is not None:
+                    L.append(f"| {label} | {_safe_num(value)} |")
+    else:
+        L.append("需人工确认：未取得可用的 AKShare/东方财富同行横截面快照。")
+    L.append("")
 
     # ── 7. 历史估值分位 ──
     valuation_history = valuation_history or {}
@@ -691,7 +1442,7 @@ def build_report(code: str, name: str,
         "",
         "## 免责声明",
         "",
-        "本报告基于 easy_tdx、Sina、efinance 和 AKShare 自动采集，仅供信息参考，不构成任何投资建议。",
+        "本报告基于 easy_tdx、BaoStock、Sina、efinance 和 AKShare 自动采集，仅供信息参考，不构成任何投资建议。",
         "数据可能因网络延迟、交易所休市等原因不完整。",
         "请以交易所官网、券商正式公告为准。",
     ]
@@ -711,15 +1462,17 @@ def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -
     print(f"  {name}({code})")
     print(f"{'='*55}")
 
-    print("[1/3] 并行获取行情、行业同行和三张财报 ...")
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    print("[1/3] 并行获取行情、行业同行、AKShare 横截面、三张财报和 BaoStock 摘要 ...")
+    with ThreadPoolExecutor(max_workers=8) as executor:
         spot_future = executor.submit(fetch_spot, code)
         company_future = executor.submit(fetch_company_and_peers, code)
+        peer_snapshot_future = executor.submit(fetch_industry_peer_snapshot, code)
         financial_futures = {
             report_type: executor.submit(fetch_financial_report, code, report_type)
             for report_type in ("lrb", "fzb", "llb")
         }
         valuation_history_future = executor.submit(fetch_historical_valuation, code)
+        baostock_summary_future = executor.submit(fetch_baostock_financial_summary, code)
 
         print("[2/3] 读取日K线 ...")
         kline_daily = fetch_kline_daily(code, kline_file)
@@ -730,10 +1483,15 @@ def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -
         info, valuation = company_future.result()
         financials = {report_type: future.result() for report_type, future in financial_futures.items()}
         valuation_history = valuation_history_future.result()
+        baostock_summary = baostock_summary_future.result()
+        industry_peer_snapshot = peer_snapshot_future.result()
 
+    direct_peers = collect_direct_peers(code, valuation)
+    direct_peers = _enrich_direct_peers_with_snapshot(direct_peers, industry_peer_snapshot)
     report = build_report(code, name, spot, info,
                           kline_daily, kline_quarterly,
-                          valuation, financials, valuation_history)
+                          valuation, financials, valuation_history, direct_peers, baostock_summary,
+                          industry_peer_snapshot)
 
     outpath = OUTPUT_BASE / f"{code}.md"
     outpath.write_text(report, encoding="utf-8")
@@ -741,8 +1499,9 @@ def analyze_stock(code: str, name: str = None, kline_file: Path | None = None) -
     # 快速摘要
     ok = sum(1 for x in [spot, info, not kline_daily.empty, not kline_quarterly.empty,
                           not valuation.empty, any(not frame.empty for frame in financials.values()),
-                          bool(valuation_history)] if x)
-    print(f"\n  ✅ 报告 ({ok}/7 数据集可用) → {outpath}")
+                          bool(valuation_history), not baostock_summary.empty,
+                          industry_peer_snapshot.get("fetch_state") == "ok"] if x)
+    print(f"\n  ✅ 报告 ({ok}/9 数据集可用) → {outpath}")
     print(f"{'='*55}")
     return str(outpath)
 

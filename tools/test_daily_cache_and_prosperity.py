@@ -111,12 +111,47 @@ class DailyCacheTest(unittest.TestCase):
                     "strength_score": 45, "strength": "中性",
                 }],
             }
-            with patch.object(congestion, "_fetch_latest", return_value=payload):
+            with patch.object(congestion, "_fetch_latest", return_value=payload), \
+                 patch.object(congestion, "SW_SNAPSHOT_CACHE_PATH", Path(directory) / "snapshot.json"), \
+                 patch.object(congestion, "_fetch_sw_second_snapshot", side_effect=PermissionError("unavailable")):
                 result = congestion.collect("电子化学品", cache_path=path, now=datetime(2026, 7, 31, 9))
             self.assertEqual(result["market_congestion_checked_date"], "2026-07-31")
             self.assertEqual(result["market_congestion_date"], "2026-05-21")
             self.assertFalse(result["market_congestion_fresh"])
             self.assertEqual(result["market_congestion_industry"], "电子化学品Ⅱ")
+
+    def test_stale_legulegu_uses_sw_activity_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = {
+                "source": "乐咕乐股/申万二级行业拥挤度",
+                "source_date": "2026-05-21",
+                "rows": [{
+                    "sw_second_name": "专用设备", "sw_second_code": "801074",
+                    "sw_first_code": "801070", "turnover_percentile": 45,
+                    "amount_ratio_percentile": 45, "congestion": 0.45,
+                    "strength_score": 45, "strength": "中性",
+                }],
+            }
+            snapshot = {"source_date": "2026-07-31", "rows": [{
+                "sw_second_name": "专用设备", "sw_second_code": "801074", "sw_first_code": "",
+            }]}
+            proxy = {
+                "source": "申万宏源研究/二级行业指数成交活跃度代理",
+                "source_date": "2026-07-31", "sw_second_name": "专用设备", "sw_second_code": "801074",
+                "amount_percentile": 0.8, "volume_percentile": 0.7, "congestion": 0.75,
+                "strength_score": 75, "strength": "偏热", "proxy": True,
+            }
+            with patch.object(congestion, "_fetch_latest", return_value=stale), \
+                 patch.object(congestion, "SW_SNAPSHOT_CACHE_PATH", root / "snapshot.json"), \
+                 patch.object(congestion, "SW_PROXY_CACHE_DIR", root / "proxy"), \
+                 patch.object(congestion, "_fetch_sw_second_snapshot", return_value=snapshot), \
+                 patch.object(congestion, "_fetch_sw_activity_proxy", return_value=proxy):
+                result = congestion.collect("专用设备", cache_path=root / "legu.json", now=datetime(2026, 7, 31, 9))
+            self.assertTrue(result["market_congestion_proxy"])
+            self.assertTrue(result["market_congestion_fresh"])
+            self.assertEqual(result["fetch_state"], "fallback_ok")
+            self.assertEqual(result["market_congestion"], 0.75)
 
     def test_industry_congestion_cache_is_shared_by_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

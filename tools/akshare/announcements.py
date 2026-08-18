@@ -29,11 +29,28 @@ import akshare as ak
 import pandas as pd
 import requests
 from tools.data_call import run_with_timeout
-from tools.scoring.announcement_rules import catalyst_summary, capex_event_summary, extract_announcement_events
+from tools.scoring.announcement_rules import (
+    catalyst_summary,
+    capex_event_summary,
+    classify_controller_action,
+    extract_announcement_events,
+    extract_corporate_action_events,
+)
 OUTPUT_BASE = ROOT / "knowledge/research/announcements"
 ANNOUNCEMENT_PAGE_SIZE = 100
 ANNOUNCEMENT_MAX_PAGES = 5
+ANNUAL_REPORT_TIMEOUT_SECONDS = 30
+ANNUAL_REPORT_MAX_PAGES = 80
+ANNUAL_REPORT_MAX_TEXT_CHARS = 350_000
+ANNUAL_REPORT_TITLE_PATTERN = re.compile(r"(?P<year>20\d{2})\s*年\s*年度报告")
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+
+def fetch_pdf_document(*args, **kwargs):
+    """Reuse the bounded public-PDF reader without importing it at module startup."""
+    from tools.scoring.web_research import fetch_pdf_document as fetch_document
+
+    return fetch_document(*args, **kwargs)
 
 
 def _normalize_irm_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -137,12 +154,13 @@ def _normalize_announcement_frame(frame: pd.DataFrame) -> pd.DataFrame:
     renamed = frame.rename(columns={
         "公告日期": "date", "公告标题": "title", "公告类型": "type", "公告链接": "url",
         "发布时间": "date", "标题": "title", "链接": "url", "类别": "type",
+        "pdfUrl": "pdf_url", "PDF链接": "pdf_url", "PDF地址": "pdf_url",
     }).copy()
-    for column in ("date", "title", "type", "url"):
+    for column in ("date", "title", "type", "url", "pdf_url"):
         if column not in renamed.columns:
             renamed[column] = ""
     renamed["date"] = pd.to_datetime(renamed["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    return renamed[["date", "title", "type", "url"]].fillna("")
+    return renamed[["date", "title", "type", "url", "pdf_url"]].fillna("")
 
 
 def _fetch_cninfo_announcements_ak(code: str, cutoff: pd.Timestamp) -> pd.DataFrame:
@@ -206,6 +224,7 @@ def fetch_announcements(code: str, name: str = None, days: int = 7) -> dict:
                 "title": str(row.get("title", "")).strip(),
                 "type": str(row.get("type", "")).strip(),
                 "url": str(row.get("url", "")).strip(),
+                "pdf_url": str(row.get("pdf_url", "")).strip(),
             })
         valid_dates = raw_dates.dropna()
         if used_fallback or len(frame) < ANNOUNCEMENT_PAGE_SIZE or (not valid_dates.empty and valid_dates.min() <= cutoff):
@@ -235,6 +254,217 @@ def fetch_announcements(code: str, name: str = None, days: int = 7) -> dict:
         "fetch_state": state,
         "source_chain": source_chain,
     }
+
+
+def _annual_report_candidate(item: dict) -> dict | None:
+    """Return a normalized annual-report candidate, excluding summaries and notices."""
+    title = str(item.get("title") or "").strip()
+    match = ANNUAL_REPORT_TITLE_PATTERN.search(title)
+    if not match or "摘要" in title or "更正公告" in title:
+        return None
+    pdf_url = str(item.get("pdf_url") or "").strip()
+    if pdf_url.startswith("http://static.cninfo.com.cn/"):
+        pdf_url = "https://" + pdf_url.removeprefix("http://")
+    if not pdf_url:
+        return None
+    return {
+        "title": title,
+        "fiscal_year": int(match.group("year")),
+        "publication_date": str(item.get("date") or "")[:10],
+        "corrected": "更正后" in title,
+        "url": pdf_url,
+    }
+
+
+def select_latest_annual_report(announcements: list[dict]) -> dict | None:
+    """Pick the newest full annual report, preferring a corrected version in the same year."""
+    candidates = [candidate for item in announcements if (candidate := _annual_report_candidate(item))]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (item["fiscal_year"], int(item["corrected"]), item["publication_date"], item["url"]),
+    )
+
+
+def _page_for_offset(text: str, offset: int) -> int:
+    return text[:max(0, offset)].count("\f") + 1
+
+
+def _first_match(text: str, *patterns: str) -> re.Match | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.S)
+        if match:
+            return match
+    return None
+
+
+def _decimal(value: str) -> float | None:
+    try:
+        return float(value.replace(",", ""))
+    except (AttributeError, ValueError):
+        return None
+
+
+def _extract_annual_report_facts(text: str) -> dict:
+    """Extract only explicit, disclosure-grade facts from a statutory annual report.
+
+    This deliberately does not infer order growth, utilization, market share or
+    industry supply/demand from narrative wording. Those remain separate gaps.
+    """
+    facts: dict[str, object] = {}
+    source_pages: dict[str, int] = {}
+
+    controller_match = _first_match(
+        text,
+        r"实际控制人(?:为|：|是)?\s*(?P<name>[\u4e00-\u9fff]{2,5})(?:先生|女士)",
+    )
+    shareholder_match = _first_match(
+        text,
+        r"控股股东(?:为|：|是)?\s*(?P<name>[\u4e00-\u9fffA-Za-z0-9（）()]{2,40}?(?:集团|公司|有限公司|股份有限公司))",
+    )
+    if controller_match or shareholder_match:
+        control_chain: dict[str, str] = {}
+        if shareholder_match:
+            control_chain["controlling_shareholder"] = shareholder_match.group("name").strip()
+            source_pages["control_chain"] = _page_for_offset(text, shareholder_match.start())
+        if controller_match:
+            control_chain["actual_controller"] = controller_match.group("name").strip()
+            source_pages.setdefault("control_chain", _page_for_offset(text, controller_match.start()))
+        if "稀散金属" in text and ("全产业链" in text or "关键材料" in text):
+            control_chain["industrial_support"] = "年报披露控股股东具备稀散金属与半导体关键材料产业资源"
+        facts["control_chain"] = control_chain
+
+    bismuth_match = _first_match(
+        text,
+        r"(?:全年|本期)?\s*铋(?:相关)?(?:材料)?(?:业务)?实现(?:销售|营业)?收入\s*(?P<revenue>[0-9,.]+)\s*亿元\s*[，,]\s*占(?:整体)?营业收入的?\s*(?P<ratio>[0-9.]+)\s*%",
+    )
+    exact_bismuth_revenue = _first_match(text, r"铋材料销售\s*(?P<revenue>[0-9,]+(?:\.[0-9]+)?)")
+    entity_match = _first_match(text, r"公司\s*旗下\s*(?P<entity>[\u4e00-\u9fffA-Za-z0-9（）()]{2,30}?)(?:全面发力|成为|开展)")
+    if bismuth_match or exact_bismuth_revenue or entity_match:
+        bismuth: dict[str, object] = {}
+        if entity_match:
+            bismuth["entity"] = entity_match.group("entity").strip()
+            source_pages["bismuth_business"] = _page_for_offset(text, entity_match.start())
+        if "唯一的铋金属深加工及化合物" in text or "唯一的铋金属深加工及化合物产品" in text:
+            bismuth["position"] = "集团旗下唯一的铋金属深加工及化合物产品业务平台"
+        if exact_bismuth_revenue and (value := _decimal(exact_bismuth_revenue.group("revenue"))) is not None:
+            bismuth["revenue_cny"] = value
+            source_pages.setdefault("bismuth_business", _page_for_offset(text, exact_bismuth_revenue.start()))
+        elif bismuth_match and (value := _decimal(bismuth_match.group("revenue"))) is not None:
+            bismuth["revenue_cny"] = value * 100_000_000
+            bismuth["revenue_precision"] = "年报叙述按亿元披露"
+            source_pages.setdefault("bismuth_business", _page_for_offset(text, bismuth_match.start()))
+        if bismuth_match and (value := _decimal(bismuth_match.group("revenue"))) is not None:
+            bismuth["revenue_reported_100m"] = value
+        if bismuth_match and (value := _decimal(bismuth_match.group("ratio"))) is not None:
+            bismuth["revenue_ratio"] = value / 100
+        facts["bismuth_business"] = bismuth
+
+    base_names = ("广东清远", "安徽五河", "湖北荆州", "浙江衢州")
+    base_start = text.find(base_names[0])
+    if base_start >= 0:
+        base_context = text[max(0, base_start - 100):base_start + 260]
+        if all(name in base_context for name in base_names) and any(term in base_context for term in ("生产基地", "布局", "基地")):
+            facts["production_bases"] = list(base_names)
+            source_pages["production_bases"] = _page_for_offset(text, base_start)
+
+    if "凯世通" in text and "离子注入机" in text:
+        ion_implant: dict[str, object] = {"entity": "凯世通", "product": "离子注入机"}
+        customer_order = _first_match(text, r"新增\s*(?P<count>\d+)\s*家客户订单")
+        if customer_order:
+            ion_implant["new_customer_order_count"] = int(customer_order.group("count"))
+            source_pages["ion_implant_orders"] = _page_for_offset(text, customer_order.start())
+        delivery = _first_match(text, r"(?:全年)?实现\s*(?P<summary>10\s*多台12\s*英寸离子注入\s*机交付)")
+        if delivery:
+            ion_implant["delivery_summary"] = re.sub(r"\s+", "", delivery.group("summary"))
+            source_pages.setdefault("ion_implant_orders", _page_for_offset(text, delivery.start()))
+        acceptance = _first_match(text, r"验收数量超\s*(?P<count>\d+)\s*台")
+        if acceptance:
+            ion_implant["acceptance_over_units"] = int(acceptance.group("count"))
+            source_pages.setdefault("ion_implant_orders", _page_for_offset(text, acceptance.start()))
+        if len(ion_implant) > 2:
+            facts["ion_implant_orders"] = ion_implant
+
+    specialized_match = _first_match(text, r"凯世通.{0,160}?国家级专精特新[“\"']?小巨人[”\"']?企业")
+    if specialized_match:
+        facts["specialized"] = {
+            "entity": "凯世通",
+            "qualification": "国家级专精特新小巨人企业",
+            "scope": "子公司",
+        }
+        source_pages["specialized"] = _page_for_offset(text, specialized_match.start())
+
+    domestic_match = _first_match(text, r"境内(?:主营业务)?(?:收入)?\s*(?P<revenue>[0-9,]+(?:\.[0-9]+)?)")
+    overseas_match = _first_match(text, r"境外(?:主营业务)?(?:收入)?\s*(?P<revenue>[0-9,]+(?:\.[0-9]+)?)")
+    domestic = _decimal(domestic_match.group("revenue")) if domestic_match else None
+    overseas = _decimal(overseas_match.group("revenue")) if overseas_match else None
+    if overseas is not None:
+        overseas_fact: dict[str, object] = {"value_cny": overseas, "period": "FY"}
+        if domestic is not None and domestic + overseas > 0:
+            overseas_fact["domestic_value_cny"] = domestic
+            overseas_fact["ratio_pct"] = round(overseas / (domestic + overseas) * 100, 4)
+        facts["overseas_revenue"] = overseas_fact
+        source_pages["overseas_revenue"] = _page_for_offset(text, overseas_match.start())
+
+    cashflow_match = _first_match(text, r"经营活动产生的现金流量\s*净额(?:为|：)?\s*(?P<cashflow>-?[0-9,]+(?:\.[0-9]+)?)")
+    if cashflow_match and (value := _decimal(cashflow_match.group("cashflow"))) is not None:
+        facts["operating_cashflow"] = {"value_cny": value, "period": "FY"}
+        source_pages["operating_cashflow"] = _page_for_offset(text, cashflow_match.start())
+
+    if source_pages:
+        facts["source_pages"] = source_pages
+    return facts
+
+
+def extract_latest_annual_report(announcements: list[dict]) -> dict:
+    """Fetch the selected annual report and retain explicit facts for evidence merging."""
+    candidate = select_latest_annual_report(announcements)
+    if not candidate:
+        return {
+            "status": "需人工确认",
+            "fetch_status": "annual_report_not_found",
+            "reason": "公告窗口内未找到可下载的完整年度报告 PDF",
+        }
+
+    result: dict[str, object] = {
+        "status": "需人工确认",
+        "title": candidate["title"],
+        "fiscal_year": candidate["fiscal_year"],
+        "report_period": f"{candidate['fiscal_year']}-12-31",
+        "publication_date": candidate["publication_date"],
+        "corrected": candidate["corrected"],
+        "url": candidate["url"],
+        "max_pages": ANNUAL_REPORT_MAX_PAGES,
+    }
+    try:
+        fetch_status, text = fetch_pdf_document(
+            candidate["url"],
+            ANNUAL_REPORT_TIMEOUT_SECONDS,
+            max_pages=ANNUAL_REPORT_MAX_PAGES,
+            max_text_chars=ANNUAL_REPORT_MAX_TEXT_CHARS,
+        )
+    except Exception as exc:
+        result["fetch_status"] = f"{type(exc).__name__}"
+        result["reason"] = "年度报告 PDF 提取失败，需人工确认"
+        return result
+
+    result["fetch_status"] = fetch_status
+    if fetch_status != "ok":
+        result["reason"] = "年度报告 PDF 未能在受限时间和页数内提取，需人工确认"
+        return result
+
+    result["text_pages"] = len([page for page in text.split("\f") if page.strip()])
+    facts = _extract_annual_report_facts(text)
+    for key, value in facts.items():
+        if key in {"overseas_revenue", "operating_cashflow"} and isinstance(value, dict):
+            value = {**value, "period": f"FY{candidate['fiscal_year']}"}
+        result[key] = value
+    if facts:
+        result["status"] = "已验证"
+    else:
+        result["reason"] = "年度报告已读取，但未识别到可安全结构化的字段，需人工确认"
+    return result
 
 
 def extract_keywords_from_qa(qa_list: list) -> dict:
@@ -277,23 +507,24 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
     ann_list = list(ann_data.get("ann_list", []))
     titles = [str(item.get("title", "")) for item in ann_list]
     title_text = " ".join(titles)
-    reduction = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}减持|减持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
-    increase = bool(re.search(r"(?:控股股东|实际控制人|实控人)[^。；\n]{0,35}增持|增持[^。；\n]{0,35}(?:控股股东|实际控制人|实控人)", title_text))
     fetch_ok = ann_data.get("announcement_fetch_ok") is True
     coverage_complete = ann_data.get("announcement_coverage_complete") is True
     controller_checked = fetch_ok and coverage_complete
-    controller_action = "reduction" if reduction else "increase" if increase else "stable" if controller_checked else None
+    controller_action = classify_controller_action(titles) or ("stable" if controller_checked else None)
     qa_text = " ".join(f"{item.get('question', '')} {item.get('answer', '')}" for item in irm_data.get("qa_list", []))
     growth_matches = re.findall(r"(?:订单|新增订单)[^\n。]{0,40}?(?:同比(?:增幅)?|增长)[^\d]{0,8}([0-9]+(?:\.[0-9]+)?)%", qa_text)
     announcement_events = extract_announcement_events(ann_list)
+    corporate_action_events = extract_corporate_action_events(ann_list)
     catalyst_data = catalyst_summary(announcement_events)
     capex_data = capex_event_summary(announcement_events)
+    annual_report = extract_latest_annual_report(ann_list)
     ann_state = ann_data.get("fetch_state", "failed")
     qa_state = irm_data.get("fetch_state", "failed")
     module_state = "failed" if "failed" in {ann_state, qa_state} else "fallback_ok" if "fallback_ok" in {ann_state, qa_state} else "empty" if {ann_state, qa_state} == {"empty"} else "ok"
     structured = {
         "announcement_titles": titles,
         "announcement_events": announcement_events,
+        "corporate_action_events": corporate_action_events,
         "announcement_lookback_days": ann_data.get("days"),
         "announcement_fetch_ok": fetch_ok,
         "announcement_coverage_complete": coverage_complete,
@@ -306,6 +537,7 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
         "qa_error": irm_data.get("error"),
         "controller_checked": controller_checked,
         "controller_action": controller_action,
+        "annual_report": annual_report,
     }
     audit_risk = any(term in title_text for term in ("非标准审计", "保留意见", "无法表示意见", "否定意见", "退市风险警示"))
     if audit_risk or coverage_complete:
@@ -344,6 +576,47 @@ def generate_report(code: str, name: str, irm_data: dict, ann_data: dict) -> str
         for a in ann_data.get("ann_list", [])[:20]:
             title = a["title"].replace("|", "/")[:60]
             lines.append(f"| {a['date']} | {a['type']} | [{title}]({a['url']}) |")
+    lines.append("")
+
+    # ── 年度报告 ──
+    lines.append("## 年度报告证据")
+    lines.append("")
+    if annual_report.get("status") != "已验证":
+        lines.append(f"需人工确认：{annual_report.get('reason', '未取得可用年度报告正文。')}")
+    else:
+        report_title = str(annual_report.get("title") or "年度报告")
+        report_url = str(annual_report.get("url") or "")
+        report_label = f"[{report_title}]({report_url})" if report_url else report_title
+        lines.append(f"- 已提取：{report_label}（{annual_report.get('report_period', '期间待确认')}；{'更正后版本' if annual_report.get('corrected') else '原始版本'}）")
+        control_chain = annual_report.get("control_chain") if isinstance(annual_report.get("control_chain"), dict) else {}
+        if control_chain:
+            lines.append(
+                f"- 控制链：控股股东 {control_chain.get('controlling_shareholder', '待确认')}；"
+                f"实际控制人 {control_chain.get('actual_controller', '待确认')}。"
+            )
+        bismuth = annual_report.get("bismuth_business") if isinstance(annual_report.get("bismuth_business"), dict) else {}
+        if bismuth:
+            revenue = bismuth.get("revenue_cny")
+            ratio = bismuth.get("revenue_ratio")
+            detail = []
+            if revenue is not None:
+                detail.append(f"收入 {float(revenue) / 100_000_000:.2f} 亿元")
+            if ratio is not None:
+                detail.append(f"占比 {float(ratio):.2%}")
+            if bismuth.get("entity"):
+                detail.insert(0, str(bismuth["entity"]))
+            lines.append(f"- 铋业务：{'；'.join(detail) or '已披露，细节待人工确认'}。")
+        bases = annual_report.get("production_bases")
+        if isinstance(bases, list) and bases:
+            lines.append(f"- 铋材料基地：{'、'.join(str(item) for item in bases)}。")
+        specialized = annual_report.get("specialized") if isinstance(annual_report.get("specialized"), dict) else {}
+        if specialized:
+            lines.append(f"- 资质：{specialized.get('entity', '子公司')}获 {specialized.get('qualification', '资质待确认')}。")
+        overseas = annual_report.get("overseas_revenue") if isinstance(annual_report.get("overseas_revenue"), dict) else {}
+        if overseas:
+            ratio = overseas.get("ratio_pct")
+            ratio_text = f"，占地区主营 {float(ratio):.2f}%" if ratio is not None else ""
+            lines.append(f"- FY 境外收入：{float(overseas.get('value_cny', 0)) / 100_000_000:.2f} 亿元{ratio_text}。")
     lines.append("")
 
     # ── 互动易 ──

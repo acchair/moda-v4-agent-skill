@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 import subprocess
@@ -29,6 +30,7 @@ def candidate_roots(script_path: Path | None = None) -> list[Path]:
             script_path.parents[2],
             Path.cwd(),
             Path("/var/minis/skills/moda-v4"),
+            script_path.parents[1] / "_runtime" / "moda-v4",
             Path.home() / ".agents" / "skills" / "moda-v4",
             Path.home() / ".codex" / "skills" / "moda-v4",
             Path.home() / ".claude" / "skills" / "moda-v4",
@@ -63,6 +65,25 @@ def _resolve_stock(root: Path, query: str) -> tuple[str, str]:
     return resolve_stock_input(query)
 
 
+def _pending_judgment_report(name: str, code: str, expression_status: str) -> str:
+    if expression_status == "stale_schema":
+        reason = "当前事实包版本已过期，需先重新采集，不能沿用旧报告。"
+    elif expression_status == "stale_expression":
+        reason = "当前事实包仍可复用，但旧版判断卡不能作为当前结论；需按 V4 重建判断层。"
+    else:
+        reason = "事实包已准备完成，需先生成 Agent Judgment V4，不能把量化审计当作投资结论。"
+    return "\n".join(
+        [
+            f"# {name}（{code}）",
+            "",
+            "## 莫大判断",
+            "",
+            f"> {reason}",
+            "",
+        ]
+    )
+
+
 def load_analysis(root: Path, code: str, name: str = "") -> dict[str, Any]:
     scorecard_path = root / "knowledge" / "research" / "scorecards" / f"{code}.json"
     report_path = root / "knowledge" / "research" / "scoring" / f"{code}.md"
@@ -73,23 +94,221 @@ def load_analysis(root: Path, code: str, name: str = "") -> dict[str, Any]:
     payload = json.loads(scorecard_path.read_text(encoding="utf-8"))
     card = payload.get("scorecard") or {}
     evidence = payload.get("evidence") or {}
+    thesis = payload.get("thesis") or {}
+    research_packet = thesis.get("research_packet") or thesis.get("thesis_context") or {}
+    schema_current = research_packet.get("schema_version") == 4
+    saved_expression = thesis.get("thesis_output") if isinstance(thesis.get("thesis_output"), dict) else {}
+    saved_expression_status = str(thesis.get("expression_status") or "collector_only")
+    expression_current = (
+        saved_expression_status == "agent_generated"
+        and saved_expression.get("schema_version") == 4
+        and saved_expression.get("expression_status") == "agent_generated"
+    )
+    if not schema_current:
+        expression_status = "stale_schema"
+    elif saved_expression_status != "agent_generated":
+        expression_status = saved_expression_status
+    else:
+        expression_status = "agent_generated" if expression_current else "stale_expression"
     pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+    resolved_name = name or evidence.get("name") or code
+    report_ready = expression_status == "agent_generated"
     return {
         "code": code,
-        "name": name or evidence.get("name") or code,
+        "name": resolved_name,
         "research_score": card.get("research_score"),
-        "action_rating": card.get("action_rating"),
-        "action_rating_reason": card.get("action_rating_reason"),
         "coverage": card.get("coverage"),
         "unknown_maximum": card.get("unknown_maximum"),
         "signal": card.get("signal"),
         "hard_caps": card.get("hard_caps") or [],
         "pipeline": pipeline,
-        "formal_report": report_path.read_text(encoding="utf-8"),
+        "research_packet": research_packet,
+        "thesis_context": research_packet,
+        "collector_status": "ready" if schema_current else "stale",
+        "expression_status": expression_status,
+        "decision_state": ((saved_expression.get("decision") or {}).get("state")) if expression_current else None,
+        "formal_report": report_path.read_text(encoding="utf-8") if report_ready else _pending_judgment_report(resolved_name, code, expression_status),
+        "formal_report_status": "ready" if report_ready else "judgment_rebuild_required",
+        "next_action": None if report_ready else (
+            "rerun_collector" if expression_status == "stale_schema" else "generate_agent_judgment_v4"
+        ),
         "report_path": str(report_path),
         "scorecard_path": str(scorecard_path),
         "pipeline_path": str(pipeline_path),
     }
+
+
+def _scorecard_from_dict(root: Path, payload: dict[str, Any]):
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    from tools.scoring.model import AdjustmentResult, FactorResult, Scorecard, SubfactorResult
+
+    factors = tuple(
+        FactorResult(
+            key=item["key"],
+            label=item["label"],
+            score=item["score"],
+            maximum=item["maximum"],
+            subfactors=tuple(
+                SubfactorResult(
+                    key=subitem["key"],
+                    label=subitem["label"],
+                    score=subitem["score"],
+                    maximum=subitem["maximum"],
+                    status=subitem["status"],
+                    reason=subitem["reason"],
+                    sources=tuple(subitem.get("sources") or ()),
+                    verified_points=subitem.get("verified_points", 0.0),
+                    provisional_points=subitem.get("provisional_points", 0.0),
+                    unknown_maximum=subitem.get("unknown_maximum", 0.0),
+                    coverage=subitem.get("coverage", 0.0),
+                )
+                for subitem in item.get("subfactors") or ()
+            ),
+            verified_points=item.get("verified_points", 0.0),
+            provisional_points=item.get("provisional_points", 0.0),
+            unknown_maximum=item.get("unknown_maximum", 0.0),
+            coverage=item.get("coverage", 0.0),
+        )
+        for item in payload.get("factors") or ()
+    )
+    adjustments = tuple(
+        AdjustmentResult(
+            key=item["key"],
+            label=item["label"],
+            score=item["score"],
+            minimum=item["minimum"],
+            maximum=item["maximum"],
+            status=item["status"],
+            reason=item["reason"],
+            sources=tuple(item.get("sources") or ()),
+            verified_points=item.get("verified_points", 0.0),
+            provisional_points=item.get("provisional_points", 0.0),
+            unknown_maximum=item.get("unknown_maximum", 0.0),
+            coverage=item.get("coverage", 0.0),
+        )
+        for item in payload.get("adjustments") or ()
+    )
+    return Scorecard(
+        factors=factors,
+        adjustments=adjustments,
+        base_score=payload["base_score"],
+        adjustment_score=payload["adjustment_score"],
+        final_score=payload["final_score"],
+        signal=payload["signal"],
+        hard_caps=tuple(payload.get("hard_caps") or ()),
+        verified_points=payload.get("verified_points", 0.0),
+        provisional_points=payload.get("provisional_points", 0.0),
+        unknown_maximum=payload.get("unknown_maximum", 0.0),
+        coverage=payload.get("coverage", 0.0),
+        research_score=payload.get("research_score", 0.0),
+    )
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _append_judgment_snapshot(root: Path, code: str, name: str, output: dict[str, Any], context: dict[str, Any]) -> Path:
+    path = root / "knowledge" / "research" / "judgments" / f"{code}.json"
+    history_payload: dict[str, Any] = {"schema_version": 1, "code": code, "name": name, "history": []}
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and isinstance(existing.get("history"), list):
+                history_payload = existing
+        except (OSError, ValueError):
+            pass
+    snapshot = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "state": output["decision"]["state"],
+        "one_sentence": output["one_sentence"],
+        "thesis": output["thesis"]["statement"],
+        "verification": output["verification"],
+        "valuation_scenarios": context.get("valuation_scenarios") or {},
+        "confidence": output.get("confidence", "低"),
+    }
+    history = history_payload.setdefault("history", [])
+    history.append(snapshot)
+    history_payload["latest"] = snapshot
+    _atomic_write(path, json.dumps(history_payload, ensure_ascii=False, indent=2))
+    return path
+
+
+def finalize_analysis(root: Path, code: str, thesis_payload: dict[str, Any], name: str = "") -> dict[str, Any]:
+    scorecard_path = root / "knowledge" / "research" / "scorecards" / f"{code}.json"
+    report_path = root / "knowledge" / "research" / "scoring" / f"{code}.md"
+    pipeline_path = root / "knowledge" / "research" / "pipeline" / f"{code}.json"
+    payload = json.loads(scorecard_path.read_text(encoding="utf-8"))
+    evidence = payload.get("evidence") or {}
+    card_dict = payload.get("scorecard") or {}
+    thesis = payload.get("thesis") or {}
+    context = thesis.get("research_packet") or thesis.get("thesis_context") or {}
+    if context.get("schema_version") != 4:
+        raise ValueError("旧 research_packet 已过期，请重新运行 moda-v4 采集器")
+
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    from tools.scoring import grader
+    from tools.scoring.thesis import validate_thesis_output
+
+    validated = validate_thesis_output(thesis_payload, context)
+    card = _scorecard_from_dict(root, card_dict)
+    pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+    requested_modules = tuple(
+        str(item.get("label"))
+        for item in pipeline
+        if isinstance(item, dict) and item.get("ok") and item.get("label") in grader.REPORTS
+    )
+    resolved_name = name or evidence.get("name") or code
+    report = grader.render_report(
+        code,
+        resolved_name,
+        evidence,
+        card,
+        requested_modules,
+        validated,
+    )
+    thesis["expression_status"] = "agent_generated"
+    thesis["thesis_output"] = validated.to_dict()
+    thesis["research_packet"] = context
+    thesis["thesis_context"] = context
+    payload["thesis"] = thesis
+
+    _atomic_write(report_path, report)
+    _atomic_write(scorecard_path, json.dumps(payload, ensure_ascii=False, indent=2))
+    judgment_path = _append_judgment_snapshot(root, code, resolved_name, validated.to_dict(), context)
+    result = load_analysis(root, code, resolved_name)
+    result["final_report_ready"] = True
+    result["judgment_path"] = str(judgment_path)
+    return result
+
+
+def finalize_a_share(
+    query: str,
+    thesis_payload: dict[str, Any],
+    *,
+    moda_root: str | Path | None = None,
+    save: bool = False,
+) -> dict[str, Any]:
+    root = find_moda_root(moda_root)
+    code, name = _resolve_stock(root, query)
+    result = finalize_analysis(root, code, thesis_payload, name)
+    if save and result["formal_report_status"] == "ready":
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        from tools.export_skill_output import export
+
+        result["saved_path"] = str(export(result["formal_report"], code, name))
+    elif save:
+        result["save_deferred"] = True
+    return result
 
 
 def analyze_a_share(
@@ -111,13 +330,15 @@ def analyze_a_share(
             raise RuntimeError(f"moda-v4 流水线运行失败，退出码 {completed.returncode}")
 
     result = load_analysis(root, code, name)
-    if save:
+    if save and result["formal_report_status"] == "ready":
         root_text = str(root)
         if root_text not in sys.path:
             sys.path.insert(0, root_text)
         from tools.export_skill_output import export
 
         result["saved_path"] = str(export(result["formal_report"], code, name))
+    elif save:
+        result["save_deferred"] = True
     return result
 
 
@@ -128,10 +349,20 @@ def main() -> None:
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--moda-root")
     parser.add_argument("--report", action="store_true", help="Print the formal Markdown report instead of JSON")
+    parser.add_argument("--thesis-json", type=Path, help="Agent expression JSON used to finalize the combined report")
     args = parser.parse_args()
-    result = analyze_a_share(args.query, args.refresh, args.save, moda_root=args.moda_root)
+    if args.thesis_json:
+        thesis_payload = json.loads(args.thesis_json.read_text(encoding="utf-8"))
+        if not isinstance(thesis_payload, dict):
+            raise ValueError("--thesis-json 必须包含 JSON 对象")
+        result = finalize_a_share(args.query, thesis_payload, moda_root=args.moda_root, save=args.save)
+    else:
+        result = analyze_a_share(args.query, args.refresh, args.save, moda_root=args.moda_root)
     if args.report:
         print(result["formal_report"])
+    elif args.thesis_json:
+        summary = {key: value for key, value in result.items() if key != "formal_report"}
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 

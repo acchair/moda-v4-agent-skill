@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from difflib import SequenceMatcher
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -22,6 +23,7 @@ CACHE_TTL = 300
 HISTORY_TTL = 7 * 86400
 FETCH_TIMEOUT = 5
 COLLECT_DEADLINE = 35
+NEWS_SEARCH_TIMEOUT = 12
 UA = "moda-v4-social/1.1"
 PROMOTION_TERMS = ("必涨", "稳赚", "翻倍", "内部消息", "老师带", "加群", "主力建仓", "最后上车", "股神", "跟单")
 RUMOR_TERMS = ("谣言", "辟谣", "澄清", "虚假", "操纵", "荐股骗局", "杀猪盘")
@@ -205,10 +207,92 @@ def _update_history(code: str, topics: list[dict], now: float | None = None) -> 
     return metrics
 
 
-def _collect_news(aliases: list[str]) -> dict:
+def _news_search_not_run() -> dict:
+    return {
+        "news_search_count": 0,
+        "news_search_records": [],
+        "news_search_provider": "",
+        "news_search_query": "",
+        "news_search_errors": [],
+        "news_search_status": "未执行",
+        "news_search_fetch_state": "not_run",
+        "news_search_source_chain": [],
+    }
+
+
+def _collect_news_candidates(code: str, name: str) -> dict:
+    """Find company-specific news leads without changing structured news metrics."""
+    company = (name or code).strip()
+    query = f"{company} {code} 新闻 公告"
+    provider = os.getenv("MODA_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
+    try:
+        from tools.scoring.web_research import _search
+
+        used, rows, errors = _search(
+            provider,
+            query,
+            NEWS_SEARCH_TIMEOUT,
+            cache_scope=f"social-news:{code}",
+        )
+    except Exception as exc:
+        used, rows, errors = "none", [], [f"news_search:{type(exc).__name__}"]
+
+    records: list[dict] = []
+    seen: set[str] = set()
+    for row in rows[:8]:
+        title = str(row.get("title") or "").strip()
+        snippet = str(row.get("snippet") or "").strip()
+        url = str(row.get("url") or "").strip()
+        text = f"{title} {snippet} {url}"
+        if not title or (code not in text and company not in text):
+            continue
+        key = _normalized_topic(title) or url
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        records.append({
+            "source": "网络搜索",
+            "title": title,
+            "snippet": snippet,
+            "text": f"{title}。{snippet}".strip("。"),
+            "url": url,
+            "published_at": str(row.get("date") or ""),
+            "status": "网络候选新闻（未核验）",
+            "provider": used,
+            "query": query,
+        })
+
+    explicit_no_results = bool(errors) and all(error.endswith(":no_results") for error in errors)
+    successful_empty = used != "none" and not rows and not errors
+    no_match = explicit_no_results or successful_empty
+    fetch_state = "fallback_ok" if records else "empty" if no_match else "failed"
+    status = "网络候选新闻（未核验）" if records else "已搜索未命中" if no_match else "搜索失败，需人工确认"
+    return {
+        "news_search_count": len(records),
+        "news_search_records": records,
+        "news_search_provider": used,
+        "news_search_query": query,
+        "news_search_errors": errors,
+        "news_search_status": status,
+        "news_search_fetch_state": fetch_state,
+        "news_search_source_chain": [{
+            "source": used if used != "none" else "网络搜索",
+            "status": "ok" if records else "empty" if no_match else "failed",
+            "error": "; ".join(errors),
+            "query": query,
+        }],
+    }
+
+
+def _collect_news(code: str, name: str, aliases: list[str]) -> dict:
     try:
         from tools.scoring.news_sentiment import collect as collect_news
-        return collect_news(aliases)
+
+        news = collect_news(aliases)
+        # Search results remain explicitly unverified leads and never enter news sentiment.
+        if not news.get("news_posts_total") and int(news.get("news_sources_ok") or 0) > 0:
+            return {**news, **_collect_news_candidates(code, name)}
+        return {**news, **_news_search_not_run()}
     except Exception as exc:
         error = f"{type(exc).__name__}: {str(exc)[:120]}"
         return {
@@ -223,6 +307,7 @@ def _collect_news(aliases: list[str]) -> dict:
             "news_rumor_hits": [],
             "fetch_state": "failed",
             "source_chain": [{"source": "新闻舆情", "status": "failed", "error": error}],
+            **_news_search_not_run(),
         }
 
 
@@ -250,7 +335,7 @@ def collect(code: str, name: str) -> dict:
     auxiliary_executor = ThreadPoolExecutor(max_workers=2)
     auxiliary_futures = {
         auxiliary_executor.submit(_collect_discussion, code, name, COLLECT_DEADLINE): "discussion",
-        auxiliary_executor.submit(_collect_news, aliases): "news",
+        auxiliary_executor.submit(_collect_news, code, name, aliases): "news",
     }
     executor = ThreadPoolExecutor(max_workers=len(FETCHERS))
     futures = {executor.submit(one, item): item[0] for item in FETCHERS.items()}
@@ -294,7 +379,7 @@ def collect(code: str, name: str) -> dict:
         auxiliary_executor.shutdown(wait=False, cancel_futures=True)
 
     discussion = auxiliary_results.get("discussion") or _collect_discussion(code, name, timeout=2)
-    news = auxiliary_results.get("news") or _collect_news(aliases)
+    news = auxiliary_results.get("news") or _collect_news(code, name, aliases)
     mentions: dict[str, list[dict]] = {}
     for platform, result in results.items():
         mentions[platform] = [row for row in result["items"] if any(alias in row.get("title", "") for alias in aliases)]
@@ -355,6 +440,7 @@ def collect(code: str, name: str) -> dict:
             "platforms": {key: value.get("source_chain", []) for key, value in results.items()},
             "discussion": discussion.get("source_chain", []),
             "news": news.get("source_chain", []),
+            "news_candidates": news.get("news_search_source_chain", []),
         },
     }
 
@@ -404,6 +490,23 @@ def _collect_discussion(code: str, name: str, timeout: float = 8) -> dict:
 
 
 def build_report(code: str, name: str, data: dict) -> str:
+    news_posts = int(data.get("news_posts_total") or 0)
+    news_candidates = int(data.get("news_search_count") or 0)
+    if news_posts:
+        news_summary = (
+            f"实时快讯匹配 {news_posts} 条；网络候选未执行（已有实时匹配）；"
+            f"情绪 {data.get('news_sentiment') or '需人工确认'}"
+        )
+    elif news_candidates:
+        news_summary = (
+            f"实时快讯匹配 0 条；网络候选 {news_candidates} 条（未核验，待正文核验，"
+            "不计入情绪、评分、热度或异常推广判断）"
+        )
+    else:
+        news_summary = (
+            f"实时快讯匹配 0 条；网络候选 0 条（{data.get('news_search_status') or '未执行'}，"
+            "不代表无新闻）"
+        )
     lines = [
         f"# 社交热榜与异常推广风险：{name or code}（{code}）",
         "",
@@ -418,7 +521,7 @@ def build_report(code: str, name: str, data: dict) -> str:
         f"- 推广话术命中：{'、'.join(data['promotional_keyword_hits']) or '无'}；个股讨论：{'、'.join(data.get('discussion_promotion_hits') or []) or '无'}",
         f"- 谣言/风险词命中：{'、'.join(data['rumor_keyword_hits']) or '无'}",
         f"- 个股讨论：{data.get('discussion_posts_total', 0)} 条；样本 {data.get('discussion_sample_status', '需人工确认')}；情绪 {data.get('discussion_sentiment') or '需人工确认'}；来源 {data.get('discussion_source_status', '需人工确认')}",
-        f"- 新闻舆情：{data.get('news_posts_total', 0)} 条；可用来源 {data.get('news_sources_ok', 0)}/{data.get('news_sources_checked', 3)}；情绪 {data.get('news_sentiment') or '需人工确认'}；仅作事件与舆情补充，不计入社交热度",
+        f"- 新闻舆情：{news_summary}；实时来源 {data.get('news_sources_ok', 0)}/{data.get('news_sources_checked', 3)}",
         "",
         "## 命中明细",
         "",
@@ -430,6 +533,22 @@ def build_report(code: str, name: str, data: dict) -> str:
             lines.append(f"| {platform} | {row.get('rank', '-')} | {str(row.get('title', '')).replace('|', '/')} |")
     if not data["social_hot_hits"]:
         lines.append("| - | - | 当前可用热榜未命中 |")
+    if news_posts == 0:
+        lines += [
+            "",
+            "## 网络候选新闻（未核验）",
+            "",
+            f"- 搜索状态：{data.get('news_search_status') or '未执行'}；后端：{data.get('news_search_provider') or '未执行'}；查询：{data.get('news_search_query') or '未执行'}",
+            "",
+            "| 后端 | 标题 | 链接 |",
+            "|---|---|---|",
+        ]
+        for row in data.get("news_search_records") or []:
+            title = str(row.get("title") or "").replace("|", "/")
+            url = str(row.get("url") or "").replace("|", "%7C")
+            lines.append(f"| {row.get('provider') or '-'} | {title} | {url or '-'} |")
+        if not news_candidates:
+            lines.append("| - | - | 未获得可核验候选 |")
     lines += [
         "",
         "说明：热榜只证明关注度。异常推广风险必须与基本面、K 线、公告澄清等独立证据交叉验证，未命中不等于安全。",

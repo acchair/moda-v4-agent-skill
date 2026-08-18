@@ -8,6 +8,8 @@ import requests
 
 from tools.data_call import run_fallback_chain
 from tools.akshare import business_data, finance_data, announcements, popularity, market_events
+from tools.providers import a_stock_data_provider
+from tools.providers.kline_quality import validate_kline_frame
 from tools.scoring import supply_demand
 
 
@@ -40,7 +42,7 @@ class DataFallbackContractTest(unittest.TestCase):
             "报告期": "2026-03-31", "分类类型": "按产品分类", "主营构成": "测试设备",
             "主营收入": 100, "收入比例": 0.5, "毛利率": 0.3,
         }])
-        with patch("tools.akshare.business_data.requests.get", side_effect=requests.Timeout("eastmoney")), \
+        with patch("tools.akshare.business_data.eastmoney_get", side_effect=requests.Timeout("eastmoney")), \
              patch("akshare.stock_zygc_em", return_value=drifted):
             frame = business_data.fetch_business_data("000001")
         self.assertEqual(frame.attrs["fetch_state"], "fallback_ok")
@@ -109,6 +111,7 @@ class DataFallbackContractTest(unittest.TestCase):
              patch.object(market_events.provider, "research_reports", return_value=empty), \
              patch.object(market_events, "fetch_pledge", return_value=empty), \
              patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_northbound_holding", return_value=empty), \
              patch.object(market_events, "fetch_top_holders", return_value=[]):
             structured, _ = market_events.collect("002422")
         fallback.assert_called_once_with("002422")
@@ -128,7 +131,7 @@ class DataFallbackContractTest(unittest.TestCase):
         self.assertEqual(frame.iloc[0]["HOLDER_NUM_RATIO"], -6.85)
 
     def test_popularity_failure_has_no_semantic_substitute(self) -> None:
-        with patch.object(popularity.requests, "post", side_effect=requests.Timeout("rank")):
+        with patch.object(popularity, "eastmoney_post", side_effect=requests.Timeout("rank")):
             result = popularity.collect("000001")
         self.assertEqual(result["fetch_state"], "failed")
         self.assertNotIn("attention_heat", result)
@@ -146,6 +149,61 @@ class DataFallbackContractTest(unittest.TestCase):
         self.assertFalse(frame.empty)
         self.assertEqual(status["fetch_state"], "fallback_ok")
         self.assertEqual(len(status["source_chain"]), 2)
+
+    def test_minute_fund_flow_never_returns_daily_fallback(self) -> None:
+        with patch.object(a_stock_data_provider, "_get_json", return_value={"data": {"klines": []}}), \
+             patch.object(a_stock_data_provider, "stock_fund_flow_120d", side_effect=AssertionError("semantic fallback forbidden")):
+            frame = a_stock_data_provider.fund_flow_minute("000001")
+        self.assertTrue(frame.empty)
+        self.assertIn("time", frame.columns)
+
+    def test_eastmoney_valuation_history_supplies_shares(self) -> None:
+        frame = pd.DataFrame({
+            "数据日期": pd.date_range("2025-01-01", periods=70),
+            "PE(TTM)": range(1, 71), "市净率": [1.0] * 70,
+            "总股本": [1000] * 70, "流通股本": [800] * 70,
+            "总市值": [2000] * 70, "流通市值": [1600] * 70,
+        })
+        with patch.object(finance_data.ak, "stock_value_em", return_value=frame), \
+             patch.object(finance_data.ak, "stock_zh_valuation_baidu", side_effect=AssertionError("fallback not expected")):
+            result = finance_data.fetch_historical_valuation("000001")
+        self.assertEqual(set(result), {"capital", "pe", "pb"})
+        self.assertEqual(result["pe"].attrs["source"], "AKShare/东方财富估值分析")
+
+    def test_report_metrics_exposes_fcf_net_debt_and_share_capital(self) -> None:
+        financials = {
+            "lrb": pd.DataFrame([{"归属于母公司的净利润": 20.0}]),
+            "fzb": pd.DataFrame([{
+                "资产总计": 500.0, "负债合计": 200.0, "货币资金": 80.0,
+                "短期借款": 30.0, "长期借款": 50.0,
+            }]),
+            "llb": pd.DataFrame([{
+                "经营活动产生的现金流量净额": 60.0,
+                "购建固定资产、无形资产和其他长期资产支付的现金": 25.0,
+            }]),
+        }
+        for item in financials.values():
+            item.attrs["fetch_state"] = "ok"
+        capital = pd.DataFrame([{
+            "数据日期": "2026-06-30", "总股本": 1000.0, "流通股本": 800.0,
+            "总市值": 2000.0, "流通市值": 1600.0,
+        }])
+        metrics = finance_data._report_metrics(
+            "000001", {}, {}, pd.DataFrame(), pd.DataFrame(), financials, {"capital": capital}
+        )
+        self.assertEqual(metrics["free_cash_flow"], 35.0)
+        self.assertEqual(metrics["net_debt"], 0.0)
+        self.assertEqual(metrics["total_shares"], 1000.0)
+
+    def test_kline_quality_rejects_invalid_ohlc_and_duplicates(self) -> None:
+        frame = pd.DataFrame([
+            {"date": "2026-08-13", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1, "amount": 10},
+            {"date": "2026-08-13", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 1, "amount": 10},
+            {"date": "2026-08-14", "open": 10, "high": 9, "low": 8, "close": 10, "volume": 1, "amount": 10},
+        ])
+        cleaned, issues = validate_kline_frame(frame, reference_date=pd.Timestamp("2026-08-15").date())
+        self.assertEqual(len(cleaned), 1)
+        self.assertIn("dropped_invalid_rows:2", issues)
 
     def test_supply_snapshot_fallback_does_not_create_history_signal(self) -> None:
         inventory = pd.DataFrame([{"日期": "2026-07-01", "库存": 100}, {"日期": "2026-07-30", "库存": 90}])

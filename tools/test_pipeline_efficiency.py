@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import numpy as np
@@ -19,6 +19,7 @@ from tools import stock_resolver
 from tools.scoring import grader
 from tools.scoring import evidence as evidence_module
 from tools.scoring.model import score_evidence
+from tools.scoring.thesis import build_thesis_context
 from tools.scoring import web_research
 from tools.scoring import search_rules
 from tools.scoring import stock_discussion
@@ -102,6 +103,134 @@ class PipelineEfficiencyTest(unittest.TestCase):
                     stock_resolver.resolve_stock_input("平安")
         finally:
             stock_resolver._INDEX = original
+
+    def test_stock_name_resolver_repairs_invalid_header_name_for_code(self) -> None:
+        original = stock_resolver._INDEX
+        try:
+            stock_resolver._INDEX = {
+                "603236": {"code": "603236", "name": "市盈率", "source": "local_report"},
+            }
+            rows = [{"code": "603236", "name": "移远通信", "source": "test"}]
+            with patch("tools.efinance.provider.search_stock", return_value=rows), \
+                 patch.object(stock_resolver, "_write_index"):
+                self.assertEqual(stock_resolver.resolve_stock_input("603236"), ("603236", "移远通信"))
+            self.assertEqual(stock_resolver._INDEX["603236"]["name"], "移远通信")
+        finally:
+            stock_resolver._INDEX = original
+
+    def test_stock_name_resolver_rejects_table_headers(self) -> None:
+        self.assertIsNone(stock_resolver._valid_name("市盈率", "603236"))
+        self.assertIsNone(stock_resolver._valid_name("603236", "603236"))
+        self.assertIsNone(stock_resolver._valid_name(
+            "药品、保健品、医疗器械的研究开发；提供医药行业技术咨询、技术培训、技术服务",
+            "301333",
+        ))
+        self.assertEqual(stock_resolver._valid_name("移远通信", "603236"), "移远通信")
+
+    def test_stock_name_resolver_uses_cninfo_profile_and_keeps_former_name_alias(self) -> None:
+        original = stock_resolver._INDEX
+        try:
+            stock_resolver._INDEX = {}
+            profile = [{
+                "code": "600641",
+                "name": "先导基电",
+                "aliases": ["万业企业"],
+                "source": "AKShare/CNINFO profile",
+            }]
+            with patch("tools.efinance.provider.search_stock", return_value=[]), \
+                    patch.object(stock_resolver, "_cninfo_profile_lookup", return_value=profile), \
+                    patch.object(stock_resolver, "_write_index"):
+                self.assertEqual(stock_resolver.resolve_stock_input("600641", "600641"), ("600641", "先导基电"))
+            self.assertEqual(stock_resolver.resolve_stock_input("万业企业"), ("600641", "先导基电"))
+        finally:
+            stock_resolver._INDEX = original
+
+    def test_no_reduction_commitment_does_not_trigger_controller_hard_cap(self) -> None:
+        title = "关于控股股东自愿承诺未来12个月不减持公司股份的公告"
+        ann_data = {
+            "ann_list": [{"date": "2026-07-31", "title": title, "url": "https://example.test"}],
+            "announcement_fetch_ok": True,
+            "announcement_coverage_complete": True,
+            "fetch_state": "ok",
+            "days": 180,
+            "source_chain": [],
+        }
+        report = announcements.generate_report("600641", "先导基电", {"qa_list": [], "fetch_state": "empty"}, ann_data)
+        payload = evidence_module.build_evidence("600641", "先导基电", {"announcements": report})
+        self.assertEqual(payload["controller_action"], "stable")
+        self.assertNotIn("reduction", {
+            item.get("category") for item in payload.get("corporate_action_events", [])
+        })
+
+    def test_corrected_annual_report_is_selected_and_only_derives_safe_evidence(self) -> None:
+        """600641 must use the corrected annual report instead of its summary or correction notice."""
+        corrected_pdf_url = "http://static.cninfo.com.cn/finalpage/2026-08-01/1225452105.PDF"
+        corrected_url = "https://static.cninfo.com.cn/finalpage/2026-08-01/1225452105.PDF"
+        ann_data = {
+            "ann_list": [
+                {"date": "2026-08-01", "title": "2025年年度报告", "type": "PDF", "url": "https://example.test/original", "pdf_url": "https://example.test/original.pdf"},
+                {"date": "2026-08-01", "title": "2025年年度报告摘要", "type": "PDF", "url": "https://example.test/summary", "pdf_url": "https://example.test/summary.pdf"},
+                {"date": "2026-08-01", "title": "2025年年度报告（更正后）", "type": "PDF", "url": "https://example.test/corrected", "pdf_url": corrected_pdf_url},
+                {"date": "2026-08-02", "title": "关于2025年年度报告的更正公告", "type": "PDF", "url": "https://example.test/correction.pdf"},
+            ],
+            "announcement_fetch_ok": True,
+            "announcement_coverage_complete": True,
+            "fetch_state": "ok",
+            "days": 365,
+            "source_chain": [],
+        }
+        annual_text = "\f".join([
+            "实际控制人朱世会先生，控股股东为先导科技集团。先导科技集团具备稀散金属全产业链和半导体关键材料产业资源。",
+            "铋材料业务实现营业收入13.20亿元，占营业收入的71.27%。"
+            "公司在广东清远、安徽五河、湖北荆州、浙江衢州布局生产基地。",
+            "凯世通离子注入机新增4家客户订单；"
+            "凯世通获评国家级专精特新\"小巨人\"企业。",
+            "境外主营业务收入550,415,075.58元，境内主营业务收入1,286,405,606.78元。"
+            "经营活动产生的现金流量净额为-4,130,756,268.10元。",
+        ])
+        with patch.object(announcements, "fetch_pdf_document", return_value=("ok", annual_text)) as fetch:
+            report = announcements.generate_report(
+                "600641", "先导基电", {"qa_list": [], "fetch_state": "empty"}, ann_data,
+            )
+
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[0], corrected_url)
+        evidence = evidence_module.build_evidence("600641", "先导基电", {
+            "finance_data": '<!-- moda_metrics: {"operating_cashflow": -1152082004.33} -->',
+            "announcements": report,
+        })
+        annual = evidence["annual_report"]
+        self.assertEqual(annual["status"], "已验证")
+        self.assertEqual(annual["title"], "2025年年度报告（更正后）")
+        self.assertEqual(annual["fiscal_year"], 2025)
+        self.assertEqual(annual["report_period"], "2025-12-31")
+        self.assertEqual(annual["publication_date"], "2026-08-01")
+        self.assertTrue(annual["corrected"])
+        self.assertEqual(annual["url"], corrected_url)
+        self.assertEqual(annual["fetch_status"], "ok")
+        self.assertEqual(annual["text_pages"], 4)
+        self.assertEqual(annual["production_bases"], ["广东清远", "安徽五河", "湖北荆州", "浙江衢州"])
+        self.assertEqual(annual["ion_implant_orders"]["new_customer_order_count"], 4)
+        self.assertEqual(annual["control_chain"]["actual_controller"], "朱世会")
+        self.assertEqual(annual["control_chain"]["controlling_shareholder"], "先导科技集团")
+        self.assertIn("稀散金属", annual["control_chain"]["industrial_support"])
+        self.assertEqual(annual["bismuth_business"]["revenue_reported_100m"], 13.2)
+        self.assertEqual(annual["bismuth_business"]["revenue_cny"], 1_320_000_000)
+        self.assertAlmostEqual(annual["bismuth_business"]["revenue_ratio"], 0.7127)
+        self.assertEqual(annual["specialized"]["qualification"], "国家级专精特新小巨人企业")
+        self.assertEqual(annual["overseas_revenue"]["value_cny"], 550_415_075.58)
+        self.assertEqual(annual["overseas_revenue"]["domestic_value_cny"], 1_286_405_606.78)
+        self.assertEqual(annual["operating_cashflow"]["value_cny"], -4_130_756_268.10)
+
+        self.assertEqual(evidence["background_quality"], 0.6)
+        self.assertTrue(evidence["background_partial"])
+        self.assertEqual(evidence["specialized_strength"], 0.5)
+        self.assertTrue(evidence["specialized_partial"])
+        self.assertAlmostEqual(evidence["overseas_revenue_ratio"], 29.97, places=2)
+        self.assertEqual(evidence["overseas_revenue_period"], "FY2025")
+        self.assertEqual(evidence["overseas_revenue_fiscal_year"], "2025")
+        self.assertNotIn("order_growth", evidence)
+        self.assertEqual(evidence["operating_cashflow"], -1152082004.33)
 
     def test_latest_classification_database_confirms_categories_by_code(self) -> None:
         result = classification_db.lookup("000002", "万科A")
@@ -277,11 +406,10 @@ class PipelineEfficiencyTest(unittest.TestCase):
                                        "reason": "控股股东减持", "provider": "duckduckgo",
                                        "hard_cap_signals": {"controller_reduction": True}}
         }
-        self.assertEqual(score_evidence(missing).rating, "根")
-        self.assertEqual(score_evidence(missing).action_rating, "买入")
+        self.assertFalse(any(item["result"] == "已触发" for item in score_evidence(missing).hard_caps))
         safe = full_evidence()
         safe["web_subfactor_results"] = missing["web_subfactor_results"]
-        self.assertEqual(score_evidence(safe).rating, "根")
+        self.assertFalse(any(item["result"] == "已触发" for item in score_evidence(safe).hard_caps))
 
     def test_search_rule_registry_covers_all_f1_to_f5_subfactors(self) -> None:
         card = score_evidence({"metric_sources": {}})
@@ -398,13 +526,13 @@ class PipelineEfficiencyTest(unittest.TestCase):
 
     def test_search_auto_prefers_searxng_and_falls_back_to_ddg(self) -> None:
         row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example"}, clear=False), \
+        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example", "SO360_SEARCH_URL": ""}, clear=False), \
              patch.object(web_research, "_searxng_search", return_value=row), \
              patch.object(web_research, "_ddg_mcp_search") as ddg:
             used, rows, _ = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("searxng", row))
         ddg.assert_not_called()
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example"}, clear=False), \
+        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example", "SO360_SEARCH_URL": ""}, clear=False), \
              patch.object(web_research, "_searxng_search", side_effect=TimeoutError), \
              patch.object(web_research, "_ddg_mcp_search", return_value=row):
             used, rows, errors = web_research._search("auto", "test", 0.1)
@@ -418,6 +546,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
             {
                 "SEARXNG_URL": "",
                 "DDG_MCP_URL": "",
+                "SO360_SEARCH_URL": "",
                 "MODA_PUBLIC_SEARCH": "auto",
             },
             clear=False,
@@ -426,6 +555,15 @@ class PipelineEfficiencyTest(unittest.TestCase):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("duckduckgo_lite", row))
         self.assertIn("duckduckgo_html:TimeoutError", errors)
+
+    def test_search_public_prefers_so360_when_it_returns_direct_results(self) -> None:
+        row = [{"title": "测试", "url": "https://www.cninfo.com.cn/a", "snippet": "测试"}]
+        with patch.dict(os.environ, {
+            "SEARXNG_URL": "", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "auto",
+            "SO360_SEARCH_URL": "https://search.example",
+        }, clear=False), patch.object(web_research, "_so360_search", return_value=row):
+            used, rows, errors = web_research._search("auto", "test", 0.1)
+        self.assertEqual((used, rows, errors), ("so360", row, []))
 
     def test_gap_search_reuses_only_same_day_success(self) -> None:
         row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
@@ -554,17 +692,19 @@ class PipelineEfficiencyTest(unittest.TestCase):
         expected_keys = [f"{item['factor_key']}.{item['subfactor_key']}" for item in selected]
         actual_keys = [f"{item['factor_key']}.{item['subfactor_key']}" for item in result["web_gap_results"]]
         self.assertEqual(actual_keys, expected_keys)
-        self.assertEqual(len(calls), len(selected) * web_research.MAX_GAP_QUERIES_PER_TARGET)
+        self.assertEqual(len(calls), sum(len(item["queries"]) for item in result["web_gap_results"]))
         self.assertEqual(
             {scope for scope, _ in calls},
             {f"000001|{key}" for key in expected_keys},
         )
         for item in result["web_gap_results"]:
             key = f"{item['factor_key']}.{item['subfactor_key']}"
-            self.assertEqual(item["queries"], [
+            expected_queries = [
+                *web_research._gap_policy_queries(key, "测试", "000001", "测试行业"),
                 *search_rules.queries_for(key, "测试", "000001", "测试行业"),
-                web_research._china_finance_query(key, "测试", "000001", "测试行业"),
-            ][:web_research.MAX_GAP_QUERIES_PER_TARGET])
+            ]
+            expected_queries = list(dict.fromkeys(expected_queries))[:web_research.MAX_GAP_QUERIES_PER_TARGET]
+            self.assertEqual(item["queries"], expected_queries)
 
     def test_specialized_status_gets_a_search_slot_before_target_limit(self) -> None:
         targets = [
@@ -595,12 +735,12 @@ class PipelineEfficiencyTest(unittest.TestCase):
             "static.cninfo.com.cn", "cls.cn", "xueqiu.com",
         ])
 
-    def test_full_framework_reaches_100_and_root(self) -> None:
+    def test_full_framework_reaches_100_without_trade_rating(self) -> None:
         card = score_evidence(full_evidence())
         self.assertEqual(card.base_score, 90)
         self.assertEqual(card.adjustment_score, 10)
         self.assertEqual(card.final_score, 100)
-        self.assertEqual(card.rating, "根")
+        self.assertNotIn("rating", card.to_dict())
         self.assertEqual(next(factor for factor in card.factors if factor.key == "F5").score, 10)
         self.assertEqual(next(factor for factor in card.factors if factor.key == "F6").score, 10)
         self.assertEqual([factor.key for factor in card.factors], ["F1", "F2", "F3", "F4", "F5", "F6"])
@@ -614,9 +754,8 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(card.unknown_maximum, 100)
         self.assertEqual(card.coverage, 0)
         self.assertEqual(card.research_score, 0)
-        self.assertEqual(card.rating, "不碰")
-        self.assertEqual(card.action_rating, "卖出")
-        self.assertEqual(card.legacy_rating, "不碰")
+        self.assertNotIn("action_rating", card.to_dict())
+        self.assertFalse(any(item["result"] == "已触发" for item in card.hard_caps))
 
     def test_f5_modifiers_are_bounded_to_ten_points(self) -> None:
         positive = score_evidence(full_evidence())
@@ -700,12 +839,14 @@ class PipelineEfficiencyTest(unittest.TestCase):
     def test_st_hard_cap(self) -> None:
         data = full_evidence()
         data["st_risk"] = True
-        self.assertEqual(score_evidence(data).rating, "不碰")
+        cap = score_evidence(data).hard_caps[0]
+        self.assertEqual((cap["result"], cap["decision_effect"]), ("已触发", "强制退出"))
 
     def test_controller_reduction_hard_cap(self) -> None:
         data = full_evidence()
         data["controller_action"] = "reduction"
-        self.assertEqual(score_evidence(data).rating, "学习仓")
+        cap = next(item for item in score_evidence(data).hard_caps if item["condition"] == "控股股东或实控人减持")
+        self.assertEqual((cap["result"], cap["decision_effect"]), ("已触发", "最高等待"))
 
     def test_factor_floor_does_not_trigger_hard_cap(self) -> None:
         data = full_evidence()
@@ -715,7 +856,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
                      "capex_strength": 0, "capex_yoy": -0.1})
         card = score_evidence(data)
         self.assertNotIn("F1 < 15 或 F3 < 8", {item["condition"] for item in card.hard_caps})
-        self.assertNotEqual(card.rating_reason, "综合分 0 对应不碰；F1 < 15 或 F3 < 8，评级最高为学习仓")
+        self.assertNotIn("rating_reason", card.to_dict())
 
     def test_stale_congestion_does_not_cap(self) -> None:
         data = full_evidence()
@@ -730,7 +871,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
                      "market_congestion_fresh": True})
         card = score_evidence(data)
         self.assertEqual(card.hard_caps[-1]["result"], "已触发")
-        self.assertEqual(card.rating, "矛")
+        self.assertEqual(card.hard_caps[-1]["decision_effect"], "最高等待")
 
     def test_axdata_is_opt_in(self) -> None:
         with patch.dict(os.environ, {"MODA_AXDATA": "0"}):
@@ -806,31 +947,27 @@ class PipelineEfficiencyTest(unittest.TestCase):
         evidence["completed_modules"] = []
         card = score_evidence(evidence)
         report = grader.render_report("300820", "英杰电气", evidence, card, ())
-        for heading in ("## 研究评分", "## 一句话结论与最终判断", "## 技术分析（easy-tdx 日 K）", "## 行业景气度交叉验证", "## 六层图形概览",
-                        "## 六层评分卡", "## F5 低位与困境反转", "## F6 修正项", "## 舆情、社交热榜与异常推广风险",
-                        "## Hard Cap 检查", "## 睡得着检查"):
+        for heading in ("## 研究概览", "## 六层评分与量化审计", "## 莫大判断", "## 技术分析（easy-tdx 日 K）", "## 行业景气度交叉验证", "### 六层图形概览",
+                        "### 六层评分卡", "#### F5 低位与困境反转", "#### F6 修正项", "### 舆情、社交热榜与异常推广风险",
+                        "### Hard Cap 检查", "### 睡得着检查"):
             self.assertIn(heading, report)
         self.assertNotIn("原始综合分", report)
         self.assertNotIn("原始评级", report)
-        conclusion = report.split("## 一句话结论与最终判断", 1)[1].split("## 六层图形概览", 1)[0]
-        for number in range(1, 7):
-            self.assertIn(f"{number}. ", conclusion)
+        conclusion = report.split("## 莫大判断", 1)[1].split("## 证据与六层诊断", 1)[0]
+        self.assertIn("莫大判断等待生成", conclusion)
         self.assertNotIn("## 最终结论", report)
         for forbidden in ("说白了", "他娘的", "我认为", "我觉得"):
             self.assertNotIn(forbidden, conclusion)
-        self.assertLess(report.index("## 一句话结论与最终判断"), report.index("## 技术分析（easy-tdx 日 K）"))
-        self.assertLess(report.index("## 技术分析（easy-tdx 日 K）"), report.index("## 六层图形概览"))
+        self.assertLess(report.index("## 莫大判断"), report.index("### 六层图形概览"))
+        self.assertLess(report.index("## 莫大判断"), report.index("## 技术分析（easy-tdx 日 K）"))
         self.assertIn("| 指标 | 当前读数 | 当前评价 |", report)
         self.assertNotIn("| 排名 | 指标", report)
         self.assertNotIn("A股适用性", report)
         self.assertIn("当前价格：30.00；支撑位：28.00；压力位：33.00", report)
         self.assertIn("F6 是独立的第六层，已计入研究分", report)
-        self.assertIn("**1. 投资主张**\n\n", report)
-        self.assertIn("**6. 行动评级与证伪条件**\n\n", report)
-        self.assertIn("投资主张态度为", report)
-        self.assertIn("同行竞争与为什么是它", report)
-        self.assertIn("## 研究评分 📊", report)
-        self.assertIn("## Hard Cap 检查 🛡️", report)
+        self.assertNotIn("**1. 投资主张**\n\n", report)
+        self.assertIn("## 六层评分与量化审计", report)
+        self.assertIn("### Hard Cap 检查 🛡️", report)
         self.assertIn("✅", report)
         self.assertNotIn("F6修正：机构方向", report)
         self.assertNotIn("## 证据覆盖与行动状态", report)
@@ -838,13 +975,10 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("## 数据覆盖与待确认", report)
         self.assertIn("### 技术信号：", report)
         self.assertNotIn("## 机构方法交叉验证", report)
-        self.assertIn("### 投资判断总览", report)
-        self.assertIn("| 核心问题 | 图示 | 大白话结论 | 数据与理由 |", report)
-        self.assertIn("投资主张", report)
-        self.assertIn("为什么可能值得买", report)
-        self.assertIn("同行竞争", report)
+        self.assertIn("### 判断层状态", report)
+        self.assertNotIn("| 核心问题 | 图示 | 大白话结论 | 数据与理由 |", report)
         self.assertIn("### 核心上下游对应表", report)
-        self.assertIn("产业链：半导体设备产业链；公司位置：上游；匹配类型：待确认", report)
+        self.assertIn("产业链：半导体设备产业链；公司位置：上游；匹配类型：无", report)
         self.assertIn("| 环节 | 核心内容 | 与公司的关系 | 判断 |", report)
         self.assertIn("公司主营映射到本环节：刻蚀设备、薄膜沉积设备；相关收入占比 60.0%", report)
 
@@ -867,15 +1001,26 @@ class PipelineEfficiencyTest(unittest.TestCase):
             },
         })
         card = score_evidence(evidence)
+        packet = build_thesis_context(card, evidence).to_dict()
         report = grader.render_report("002389", "航天彩虹", evidence, card, ())
-        conclusion = report.split("## 一句话结论与最终判断", 1)[1].split("## 技术分析（easy-tdx 日 K）", 1)[0]
+        conclusion = report.split("## 莫大判断", 1)[1].split("## 技术分析（easy-tdx 日 K）", 1)[0]
 
-        self.assertIn("航天彩虹当前正式行动评级为", conclusion)
-        self.assertIn("主营集中在航空航天产品制造", conclusion)
-        self.assertIn("当前价格为18.47元", conclusion)
-        self.assertIn("TTM PE为675.40、PB为2.24", conclusion)
-        self.assertIn("个股关注度为84.61%，所属行业拥挤度为32.00%", conclusion)
-        self.assertIn("缠论结构向上、MACD多头、OBV资金中性、WR中性", conclusion)
+        self.assertIn("莫大判断等待生成", conclusion)
+        self.assertEqual(packet["company"]["name"], "航天彩虹")
+        self.assertIn("航空航天产品制造", packet["company"]["main_business"])
+        self.assertEqual(packet["valuation"]["latest_price"]["value"], 18.469999313354492)
+        self.assertEqual(packet["valuation"]["pe_ttm"]["value"], 675.396484375)
+        self.assertEqual(packet["valuation"]["pb"]["value"], 2.2423210234058315)
+        self.assertEqual(packet["a_share_signals"]["attention_heat"]["value"], 0.8461)
+        self.assertEqual(packet["a_share_signals"]["market_congestion"]["value"], 0.32)
+        self.assertEqual(packet["a_share_signals"]["technical_signal"], "中性/无触发")
+        self.assertIn("TTM PE 675.40", report)
+        self.assertIn("PB 2.24", report)
+        self.assertIn("个股关注热度：0.8461", report)
+        self.assertIn("市场拥挤度：0.32", report)
+        self.assertIn("| MACD | 无 | 多头 |", report)
+        self.assertIn("| OBV | 无 | 资金中性 |", report)
+        self.assertIn("| WR | 无 | 中性 |", report)
         self.assertNotIn("聚光科技", report)
         self.assertNotIn("环保监测", report)
         self.assertNotIn("缠论结构仍向下、WR处于超买区", report)
@@ -909,9 +1054,9 @@ class PipelineEfficiencyTest(unittest.TestCase):
         gap = next(item for item in f5.subfactors if item.key == "expectation_gap")
         self.assertEqual(gap.score, 1.5)
 
-    def test_missing_evidence_does_not_trigger_action_no_touch(self) -> None:
+    def test_missing_evidence_does_not_trigger_hard_cap(self) -> None:
         card = score_evidence({"metric_sources": {}})
-        self.assertEqual(card.action_rating, "卖出")
+        self.assertNotIn("action_rating", card.to_dict())
         self.assertFalse(any(item["result"] == "已触发" for item in card.hard_caps))
 
     def test_search_failure_preserves_structured_score_and_status(self) -> None:
@@ -941,7 +1086,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
             },
         }
         card = score_evidence(data)
-        self.assertEqual(card.action_rating, "买入")
+        self.assertNotIn("action_rating", card.to_dict())
         self.assertEqual(next(item for item in card.hard_caps if item["condition"] == "控股股东或实控人减持")["result"], "需人工确认")
 
     def test_nominee_holder_is_not_negative_background(self) -> None:
@@ -968,11 +1113,29 @@ class PipelineEfficiencyTest(unittest.TestCase):
             })
             self.assertEqual(evidence.get("chain_name"), expected)
 
+    def test_cro_main_business_beats_aigc_concept_and_generic_medical_label(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "医疗服务", "chain_name": "AIGC/多模态AI产业链", "chain_stage": "downstream", "concepts": ["AIGC概念", "CXO概念", "AI医疗概念"]} -->',
+            "business_data": '<!-- moda_business: {"main_business": "临床试验相关及实验室服务、临床试验技术服务", "business_items": ["临床试验相关服务", "研究数据管理", "统计分析"]} -->',
+        }
+        evidence = evidence_module.build_evidence("301333", "诺思格", reports)
+        self.assertEqual(evidence["chain_name"], "CXO产业链")
+        self.assertEqual(evidence["chain_stage"], "midstream")
+        self.assertNotIn("AIGC/多模态AI产业链", [item["chain_name"] for item in evidence["chain_matches"]])
+
+    def test_aigc_primary_business_keeps_aigc_chain_when_concept_is_supported(self) -> None:
+        reports = {
+            "finance_data": '<!-- moda_metrics: {"industry": "医疗", "concepts": ["AIGC概念", "AI医疗概念"]} -->',
+            "business_data": '<!-- moda_business: {"main_business": "提供AIGC内容生成、文生图、文生视频和多模态模型服务", "business_items": ["AIGC", "文生图", "文生视频", "多模态模型"]} -->',
+        }
+        evidence = evidence_module.build_evidence("300001", "AI医疗测试", reports)
+        self.assertEqual(evidence["chain_name"], "AIGC/多模态AI产业链")
+
     def test_confirmed_high_risk_caps_survive_unknown_coverage(self) -> None:
         data = {"metric_sources": {}, "st_risk": True}
         card = score_evidence(data)
-        self.assertEqual(card.action_rating, "卖出")
-        self.assertEqual(card.rating, "不碰")
+        self.assertEqual(card.hard_caps[0]["decision_effect"], "强制退出")
+        self.assertNotIn("rating", card.to_dict())
 
     def test_industry_prosperity_only_changes_confidence_not_score(self) -> None:
         baseline = score_evidence(full_evidence())
@@ -1071,7 +1234,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(evidence["chain_name"], "半导体电子特气产业链")
         self.assertEqual(evidence["chain_stage"], "upstream")
         self.assertTrue(evidence["chain_partial"])
-        self.assertIn("SearXNG + DuckDuckGo MCP", evidence["metric_sources"]["chain_name"])
+        self.assertIn("SearXNG + 360 搜索 + DuckDuckGo + 带引用的模型搜索", evidence["metric_sources"]["chain_name"])
 
     def test_unconfirmed_business_revenue_caps_chain_match(self) -> None:
         data = full_evidence()
@@ -1090,7 +1253,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         evidence["completed_modules"] = []
         card = score_evidence(evidence)
         report = grader.render_report("301128", "强瑞技术", evidence, card, ())
-        overview = report.split("## 六层图形概览", 1)[1].split("## 六层评分卡", 1)[0]
+        overview = report.split("### 六层图形概览", 1)[1].split("## 莫大判断", 1)[0]
         for factor in card.factors:
             self.assertIn(factor.key, overview)
             self.assertIn(grader._progress_bar(factor.score, factor.maximum), overview)
@@ -1098,7 +1261,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
     def test_web_supply_requires_two_domains_categories_and_authority(self) -> None:
         records = [
             {"fetch_status": "ok", "domain": "cninfo.com.cn", "source_tier": "A", "supply_categories": ["orders"], "supply_direction": "tightening"},
-            {"fetch_status": "ok", "domain": "example.com", "source_tier": "B", "supply_categories": ["capacity"], "supply_direction": "tightening"},
+            {"fetch_status": "ok", "domain": "stats.gov.cn", "source_tier": "A", "supply_categories": ["capacity"], "supply_direction": "tightening"},
         ]
         result = web_research._validate_supply(records)
         self.assertEqual(result["status"], "已验证")
@@ -1293,11 +1456,39 @@ class PipelineEfficiencyTest(unittest.TestCase):
 
     def test_public_search_fallback_is_used_without_local_backend(self) -> None:
         row = [{"title": "公开搜索结果", "url": "https://example.com", "snippet": "测试"}]
-        with patch.dict(os.environ, {"SEARXNG_URL": "", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "auto"}, clear=False), \
+        with patch.dict(os.environ, {"SEARXNG_URL": "", "DDG_MCP_URL": "", "SO360_SEARCH_URL": "", "MODA_PUBLIC_SEARCH": "auto"}, clear=False), \
              patch.object(web_research, "_duckduckgo_html_search", return_value=row):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("duckduckgo_html", row))
         self.assertEqual(errors, [])
+
+    def test_model_search_bridge_is_last_resort_and_requires_urls(self) -> None:
+        cited = [{"title": "公告", "url": "https://www.cninfo.com.cn/a", "snippet": "原文"}]
+        with patch.dict(os.environ, {
+            "SEARXNG_URL": "", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off",
+            "MODA_MODEL_SEARCH_PROVIDER": "bridge", "MODA_MODEL_SEARCH_URL": "https://model-search.example",
+        }, clear=False), patch.object(web_research, "_model_search_bridge", return_value=cited):
+            used, rows, _ = web_research._search("auto", "test", 0.1)
+        self.assertEqual(used, "model_search_bridge")
+        self.assertEqual(rows, cited)
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": [{"title": "无引用", "summary": "模型回答"}]}
+        with patch.dict(os.environ, {"MODA_MODEL_SEARCH_URL": "https://model-search.example"}, clear=False), \
+             patch.object(web_research, "_http_session", return_value=MagicMock(post=MagicMock(return_value=response))):
+            self.assertEqual(web_research._model_search_bridge("test", 0.1), [])
+
+    def test_openai_response_sources_are_parsed_as_search_rows(self) -> None:
+        payload = {
+            "output_text": "带引用摘要",
+            "output": [{"type": "web_search_call", "action": {"sources": [
+                {"title": "巨潮公告", "url": "https://www.cninfo.com.cn/a"},
+            ]}}],
+        }
+        rows = web_research._response_search_rows(payload)
+        self.assertEqual(rows[0]["title"], "巨潮公告")
+        self.assertEqual(rows[0]["url"], "https://www.cninfo.com.cn/a")
 
     def test_industry_alias_maps_non_shenwan_label(self) -> None:
         from tools.akshare import congestion, industry_prosperity
@@ -1343,6 +1534,20 @@ class PipelineEfficiencyTest(unittest.TestCase):
         with patch.object(finance_data, "fetch_kline_daily", side_effect=AssertionError("network fetch not expected")):
             quarterly = finance_data.fetch_kline_quarterly("300820", daily)
         self.assertFalse(quarterly.empty)
+
+    def test_pipeline_kline_cache_is_reused_across_runs(self) -> None:
+        dates = pd.bdate_range(end="2026-08-14", periods=80)
+        frame = pd.DataFrame({
+            "date": dates, "open": 10.0, "high": 11.0, "low": 9.0,
+            "close": 10.0, "volume": 100.0, "amount": 1000.0,
+        })
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(run_pipeline, "CACHE_ROOT", Path(directory)), \
+             patch("tools.providers.easy_tdx_provider.fetch_kline_daily", return_value=frame) as fetch:
+            first = run_pipeline.prepare_kline("000001")
+            second = run_pipeline.prepare_kline("000001")
+        self.assertEqual(first, second)
+        self.assertEqual(fetch.call_count, 1)
 
     def test_tdx_report_accepts_numpy_score_array(self) -> None:
         dates = pd.date_range("2025-01-01", periods=180, freq="D")
@@ -1458,6 +1663,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
              patch.object(market_events, "_ak_lockup", side_effect=requests.Timeout("timeout")), \
              patch.object(market_events, "_ak_pledge", side_effect=requests.Timeout("timeout")), \
              patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_northbound_holding", return_value=empty), \
              patch.object(market_events, "fetch_top_holders", return_value=[]):
             structured, _ = market_events.collect("000001")
         self.assertFalse(structured["pledge_fetch_ok"])
@@ -1473,6 +1679,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
              patch.object(market_events.provider, "research_reports", return_value=empty), \
              patch.object(market_events, "fetch_pledge", return_value=empty), \
              patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_northbound_holding", return_value=empty), \
              patch.object(market_events, "fetch_top_holders", return_value=[]):
             structured, _ = market_events.collect("000001")
         self.assertEqual(structured["pledge_ratio"], 0.0)
@@ -1488,6 +1695,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
              patch.object(market_events.provider, "research_reports", return_value=empty), \
              patch.object(market_events, "fetch_pledge", return_value=pledge), \
              patch.object(market_events, "fetch_fund_holding", return_value=empty), \
+             patch.object(market_events, "fetch_northbound_holding", return_value=empty), \
              patch.object(market_events, "fetch_top_holders", return_value=[]):
             structured, _ = market_events.collect("000001")
         self.assertNotIn("pledge_ratio", structured)
@@ -1519,12 +1727,24 @@ class PipelineEfficiencyTest(unittest.TestCase):
             "pe_dynamic": 71.47, "pe_ttm": 46.61, "net_assets": 11.613,
             "total_market_cap_ab": 10_388_041_728, "eps": 0.16,
         }])
+        sw_second = pd.DataFrame([{
+            "行业代码": "801733.SI", "行业名称": "其他电源设备Ⅱ", "上级行业": "电力设备",
+        }])
+        components = pd.DataFrame([{"证券代码": "300820", "证券名称": "英杰电气"}])
         with patch("tools.providers.easy_tdx_provider.fetch_belong_boards", return_value=boards), \
-             patch("tools.providers.easy_tdx_provider.fetch_board_members", return_value=members) as fetch_members:
+             patch("tools.providers.easy_tdx_provider.fetch_board_members", return_value=members) as fetch_members, \
+             patch.object(finance_data.ak, "sw_index_second_info", return_value=sw_second), \
+             patch.object(finance_data.ak, "index_component_sw", return_value=components):
             info, peers = finance_data.fetch_company_and_peers("300820")
         fetch_members.assert_called_once_with("881285")
         self.assertEqual(info["行业"], "其他发电设备")
+        self.assertEqual(info["同行候选口径"], "同一申万二级行业")
+        self.assertEqual(peers.attrs["peer_scope_status"], "已验证")
         self.assertAlmostEqual(peers.iloc[0]["市净率"], 46.75 / 11.613)
+
+    def test_direct_peers_require_verified_sw_second_scope(self) -> None:
+        peers = pd.DataFrame([{"代码": "300820", "简称": "英杰电气"}])
+        self.assertEqual(finance_data.collect_direct_peers("300820", peers), [])
 
     def test_announcements_use_one_stock_request(self) -> None:
         frame = pd.DataFrame(
@@ -1597,7 +1817,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(evidence["capex_strength"], 0.5)
         self.assertTrue(evidence["capex_partial"])
         self.assertNotIn("easy_tdx/CNINFO + AKShare/CNINFO", evidence["metric_sources"]["capex_strength"])
-        self.assertIn("SearXNG + DuckDuckGo MCP", evidence["metric_sources"]["capex_strength"])
+        self.assertIn("SearXNG + 360 搜索 + DuckDuckGo + 带引用的模型搜索", evidence["metric_sources"]["capex_strength"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -425,7 +425,7 @@ chains:
       keywords: [试剂, 耗材, 色谱柱, 质谱仪, 反应釜, 冻干机, 实验室设备]
     midstream:
       industries: [医疗服务, 生物制品]
-      keywords: [药物发现, 临床前CRO, 临床CRO, CDMO, CMO, 制剂CDMO, 大分子CDMO, 基因治疗CDMO, SMO]
+      keywords: [药物发现, 临床前CRO, 临床CRO, CDMO, CMO, 制剂CDMO, 大分子CDMO, 基因治疗CDMO, SMO, 临床试验相关, 临床试验技术服务, 研究数据管理, 统计分析]
     downstream:
       industries: [化学制药, 生物制品]
       keywords: [创新药企, Big Pharma, Biotech, 仿制药企]
@@ -1095,6 +1095,7 @@ chains:
   # ═══════════════════ AI应用类补充 ═══════════════════
   - name: AIGC/多模态AI产业链
     aliases: ['AIGC', '多模态AI', '生成式AI', '大模型应用', 'Sora']
+    require_primary_anchor: true
     upstream:
       industries: ['半导体', '计算机设备', 'IT服务']
       keywords: ['GPU集群', 'AI芯片', '训练框架', 'PyTorch', 'TensorFlow', '数据标注', '语料库', '算力租赁', '智算中心']
@@ -1474,6 +1475,17 @@ chains:
     downstream:
       industries: ['半导体', '电子元件']
       keywords: ['晶圆制造', '芯片制造', '封装测试', '光刻工艺', '刻蚀工艺', '薄膜沉积', 'CMP工艺', '清洗工艺', '国产替代', '半导体材料国产化']
+  - name: 稀散金属/铋深加工产业链
+    aliases: ['铋相关材料', '铋材料', '铋深加工', '铋金属', '铋化合物']
+    upstream:
+      industries: ['有色金属', '化学原料']
+      keywords: ['铋矿', '粗铋', '铋锭', '稀散金属', '金属提纯']
+    midstream:
+      industries: ['有色金属', '化学制品', '电子化学品', '半导体']
+      keywords: ['铋相关材料', '铋材料', '铋金属制品', '铋化合物', '铋半导体材料', '三氧化二铋', '氯氧化铋', '铋基靶材']
+    downstream:
+      industries: ['半导体', '医药生物', '电力设备', '电子元件']
+      keywords: ['电子半导体', '医药', '新能源材料', '热电材料', 'Micro-TEC', '靶材', '固态电池']
   - name: PCB产业链
     aliases: ['PCB', '印制电路板', 'HDI', 'FPC', 'IC载板']
     upstream:
