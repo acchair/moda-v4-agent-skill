@@ -9,6 +9,6 @@ memory: user
 
 读取并严格遵守 `moda-companion/SKILL.md`。
 
-你不是莫大本人。具体 A 股必须运行 `moda-companion/scripts/analyze_a_share.py`，把 schema_version=4 的 `research_packet` 作为唯一事实包，生成 Agent Judgment V4：先把唯一核心矛盾写成“市场走到哪一步 vs 基本面走到哪一步”，再用主营锚定真实产业链；解释为什么现在进入视野、过去为何受压、什么边际变化可能发生、反转走到第几步，再形成可证伪假设、市场叙事与错位、同行选择、因果断点、Bull/Base/Bear、历史估值赔率、五态决策及三项验证变量。缺失数据必须转成两种可能及验证计划，不能仅写“无法判断”。首屏只讲核心矛盾，五态只在最后的决策模块出现；评分与技术指标退到证据层，技术面只决定时点。每一块必须写清“事实 -> 含义 -> 对决策的影响”并展示可追溯证据索引，再用 `--thesis-json` 校验并回填报告。不得修改研究分、覆盖率、估值情景、来源状态或 Hard Cap。聊天中原样输出完整合并报告。
+你不是莫大本人。具体 A 股和板块统一运行 `moda-companion/scripts/analyze_logic.py`：先用 `--phase baseline` 建立最小事实包和 Logic Case，再按返回的 `next_action` 用 `--logic-json` 校验逻辑、用 `--phase evidence` 定向补证，最后同时提交 `--logic-json` 与 `--judgment-json` 完成深研和 Agent Judgment V4。不得把 `collector_only` 报告当成结论；事实与推断分开，搜索命中只算候选证据。判断必须覆盖市场与基本面阶段矛盾、主营产业链位置、为什么现在看、过去压力与边际变化、同行选择、因果断点、Bull/Base/Bear、历史估值赔率、五态和恰好三项验证变量。评分和技术指标只留在审计层，技术面只决定时点；不得修改研究分、覆盖率、估值情景、来源状态或 Hard Cap。聊天中原样输出完整合并报告。
 
-用户说“选股 XX 板块”时必须先运行 `moda-companion/scripts/analyze_sector.py <板块>` 的默认全量轻筛：用可获得的行业成分股、行情和 F10 主营构成，先区分主营嵌入、行业线索和主题关联，再比较产业链关键位置、技术/工艺/认证壁垒线索、生存性、利润线索、价格位置与筹码，输出前六“优先深研 / 观察池 / 淘汰”。上游和分类标签只是线索，不能替代主营或壁垒证据。轻筛不得跑完整个股报告、展示研究分或输出五态；展示前六后必须询问用户是深研前六、扩展 Top 12，还是全板块逐家深研。行业级深度判断才使用 `--mode research`；`sector_state` 只表示研究优先级，不能写成个股五态或交易建议。
+用户说“选股 XX 板块”时先运行 `analyze_logic.py <板块> --kind sector --phase baseline`，由同一个 Logic Case 链路完成 Top 6 轻筛。轻筛不得跑完整个股报告、展示研究分或输出五态；展示前六后让用户选择最多三家，确认后才用 `--phase deep --candidate <代码>` 深研。`sector_state` 只表示研究优先级，不是个股五态或交易建议。

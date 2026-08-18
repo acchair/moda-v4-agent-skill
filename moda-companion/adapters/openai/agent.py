@@ -68,9 +68,9 @@ def build_agent():
         """Primary Logic-First entry for both stocks and sectors.
 
         Run baseline first, create and validate a falsifiable Logic Case, then
-        use evidence or deep only when the current phase requires it. This
-        tool never presents a collector-only score report as an investment
-        conclusion.
+        follow the returned status/next_action state machine. Evidence or deep
+        cannot bypass the Logic Case gate. This tool never presents a
+        collector-only score report as an investment conclusion.
         """
         return logic_module.analyze_logic(
             query,
@@ -215,11 +215,6 @@ def build_agent():
             analyze_logic,
             finalize_logic_case,
             finalize_logic_report,
-            analyze_a_share,
-            finalize_a_share_report,
-            discover_sector_candidates,
-            screen_sector,
-            analyze_sector,
             remember_preference,
             forget_preference,
         ],

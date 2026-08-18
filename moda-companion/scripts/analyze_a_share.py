@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import importlib.util
 import json
 import os
 import subprocess
@@ -342,6 +343,29 @@ def analyze_a_share(
     return result
 
 
+def _run_logic_baseline(
+    query: str,
+    *,
+    refresh: bool = False,
+    moda_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compatibility CLI route; user research starts at Logic Case baseline."""
+    logic_path = Path(__file__).with_name("analyze_logic.py")
+    spec = importlib.util.spec_from_file_location("moda_companion_logic_cli", logic_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("无法加载逻辑优先入口")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.analyze_logic(
+        query,
+        kind="stock",
+        phase="baseline",
+        refresh=refresh,
+        save=True,
+        moda_root=moda_root,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run moda-v4 and return the stable Agent tool result")
     parser.add_argument("query", help="A-share name or six-digit code")
@@ -357,9 +381,9 @@ def main() -> None:
             raise ValueError("--thesis-json 必须包含 JSON 对象")
         result = finalize_a_share(args.query, thesis_payload, moda_root=args.moda_root, save=args.save)
     else:
-        result = analyze_a_share(args.query, args.refresh, args.save, moda_root=args.moda_root)
+        result = _run_logic_baseline(args.query, refresh=args.refresh, moda_root=args.moda_root)
     if args.report:
-        print(result["formal_report"])
+        print(result.get("formal_report") or result.get("logic_report", ""))
     elif args.thesis_json:
         summary = {key: value for key, value in result.items() if key != "formal_report"}
         print(json.dumps(summary, ensure_ascii=False, indent=2))

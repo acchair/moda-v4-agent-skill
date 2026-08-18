@@ -15,6 +15,17 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 ANALYZE_A_SHARE = SCRIPT_ROOT / "analyze_a_share.py"
 ANALYZE_SECTOR = SCRIPT_ROOT / "analyze_sector.py"
 
+LOGIC_READY_PHASES = {"logic_validated", "evidence"}
+NEXT_ACTIONS = {
+    "needs_logic": "write_logic_case",
+    "needs_evidence": "targeted_evidence",
+    "needs_candidate_selection": "select_candidates",
+    "needs_deep_research": "deep_research",
+    "needs_judgment": "write_judgment_v4",
+    "ready": "render_report",
+    "failed": "manual_review",
+}
+
 
 def _load_module(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -74,6 +85,31 @@ def _packet_from_reports(
     card = score_evidence(evidence)
     packet = build_thesis_context(card, evidence).to_dict()
     return packet, card.to_dict(), evidence
+
+
+def _require_logic_stage(
+    case: Mapping[str, Any],
+    action: str,
+    *,
+    allow_needs_candidate_selection: bool = False,
+) -> None:
+    """Prevent evidence/deep collection from bypassing the Logic Case gate."""
+    phase = str(case.get("phase") or "")
+    status = str(case.get("status") or "")
+    if phase not in LOGIC_READY_PHASES:
+        raise ValueError(
+            f"{action} 前必须先提交并校验 Logic Case；当前 phase={phase or 'unknown'}。"
+        )
+    if status == "needs_logic":
+        raise ValueError(f"{action} 前必须先完成投资命题和产业链 Logic Map。")
+    if action == "deep" and status == "needs_evidence":
+        raise ValueError("完整深研前必须先完成定向补证，并用新证据更新 Logic Case。")
+    if action == "deep" and status == "needs_candidate_selection" and not allow_needs_candidate_selection:
+        raise ValueError("完整深研前必须先明确选择候选公司。")
+
+
+def _next_action(case: Mapping[str, Any]) -> str:
+    return NEXT_ACTIONS.get(str(case.get("status") or ""), "manual_review")
 
 
 def _collect_stock_baseline(root: Path, code: str, name: str, refresh: bool) -> dict[str, Any]:
@@ -234,6 +270,7 @@ def _result(case: Mapping[str, Any], paths: Mapping[str, str], **extra: Any) -> 
         "kind": case.get("kind"),
         "phase": case.get("phase"),
         "status": case.get("status"),
+        "next_action": _next_action(case),
         "logic_case": dict(case),
         "logic_report": extra.pop("logic_report", ""),
         **dict(paths),
@@ -287,6 +324,7 @@ def analyze_logic(
         elif phase == "evidence":
             if previous is None:
                 raise ValueError("板块或概念广搜前必须先建立并保存 logic_case")
+            _require_logic_stage(previous, "evidence")
             from tools.scoring.sector_broad_research import collect_sector_broad_evidence
 
             previous_context = previous.get("context") if isinstance(previous.get("context"), Mapping) else {}
@@ -299,10 +337,11 @@ def analyze_logic(
             case["phase"] = "evidence"
             # Broad search only supplies auditable material.  The user still
             # needs to state the sector thesis before any deep research.
-            case["status"] = "needs_logic"
+            case["status"] = engine.derive_status(case)
         elif phase == "deep":
             if previous is None:
                 raise ValueError("板块或概念深研前必须先建立并保存 logic_case")
+            _require_logic_stage(previous, "deep", allow_needs_candidate_selection=True)
             selected = [str(item).strip() for item in (candidates or []) if str(item).strip()]
             if not selected:
                 selected = [
@@ -351,6 +390,7 @@ def analyze_logic(
         elif phase == "evidence":
             if previous is None:
                 raise ValueError("补证前必须先建立并保存 logic_case")
+            _require_logic_stage(previous, "evidence")
             evidence_run = _collect_targeted_stock(
                 root,
                 code,
@@ -370,8 +410,7 @@ def analyze_logic(
         elif phase == "deep":
             if previous is None:
                 raise ValueError("深研前必须先建立并保存 logic_case")
-            if previous.get("status") == "needs_logic":
-                raise ValueError("必须先完成投资命题和产业链 Logic Map，才能启动完整个股深研")
+            _require_logic_stage(previous, "deep")
             deep = a_share.analyze_a_share(query, refresh=refresh, save=False, moda_root=root, run_pipeline=True)
             case = engine.attach_research_packet(previous, deep["research_packet"], {
                 "stage": "deep_research",
@@ -436,6 +475,9 @@ def finalize_logic_report(
     logic = dict(logic_payload)
     logic.update({"schema_version": 1, "case_id": case_id, "query": query, "kind": "stock"})
     case = engine.validate_logic_case(logic, previous=previous)
+
+    if engine.derive_status(case) in {"needs_logic", "needs_evidence"}:
+        raise ValueError("正式判断前必须先闭合 Logic Case 的关键证据缺口。")
 
     deep = a_share.analyze_a_share(query, refresh=False, save=False, moda_root=root, run_pipeline=True)
     case = engine.attach_research_packet(case, deep["research_packet"], {

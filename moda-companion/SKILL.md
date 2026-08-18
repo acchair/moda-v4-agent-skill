@@ -47,6 +47,8 @@ python scripts/memory.py list
 
 正确链路是：`用户问题 → 最小事实包 → 可证伪逻辑 → 逐箭头证据计划 → 定向补证与反证 → 同行比较 → 市场预期与赔率 → 个股五态 → 三项跟踪变量`。F1-F6、覆盖率、技术和 Hard Cap 保留在审计层，不能反向替代前台逻辑。
 
+每次调用 `analyze_logic.py` 后必须读取返回的 `status` 和 `next_action`，只执行下一步允许的阶段：`write_logic_case → targeted_evidence → deep_research → write_judgment_v4 → render_report`。如果状态仍为 `needs_logic` 或 `needs_evidence`，不得直接启动完整深研。
+
 1. 用户给出具体 A 股：
    - 读取 [references/method.md](references/method.md)、[references/expression.md](references/expression.md) 与 [references/boundaries.md](references/boundaries.md)。
    - 先调用 `python scripts/analyze_logic.py <股票> --kind stock --phase baseline`，建立最小事实包和 Logic Case；不得自行估分或绕开 moda-v4。

@@ -20,6 +20,19 @@
 
 `tools/run_pipeline.py` 仍是完整证据流水线，不再是对话主入口。Logic Case 持久化在 `knowledge/research/logic_cases/{case_id}/`，板块主逻辑由候选公司共享；公司分支只回答受益层级和竞争差异。任何搜索结果在核验前都只能进入候选证据，不能把叙事升级为事实。
 
+运行时由 `status → next_action` 驱动，不允许跳阶段：
+
+```text
+needs_logic             -> write_logic_case
+needs_evidence          -> targeted_evidence
+needs_candidate_selection -> select_candidates
+needs_deep_research     -> deep_research
+needs_judgment          -> write_judgment_v4
+ready                   -> render_report
+```
+
+`evidence` 和 `deep` 必须从已校验的 `logic_validated/evidence` 阶段进入；个股在仍有关键证据缺口时不能直接深研。旧 `analyze_a_share.py` 只保留为内部兼容实现，用户适配器和 OpenAI 工具列表不再暴露该绕行入口。
+
 ```text
 股票代码/名称
   -> tools/run_pipeline.py

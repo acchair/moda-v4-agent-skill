@@ -23,6 +23,24 @@ installer = load_module("companion_logic_installer", ROOT / "install.py")
 
 
 class LogicEntryTest(unittest.TestCase):
+    def test_next_action_exposes_the_runtime_state_machine(self) -> None:
+        self.assertEqual(logic_entry._next_action({"status": "needs_logic"}), "write_logic_case")
+        self.assertEqual(logic_entry._next_action({"status": "needs_evidence"}), "targeted_evidence")
+        self.assertEqual(logic_entry._next_action({"status": "needs_judgment"}), "write_judgment_v4")
+        self.assertEqual(logic_entry._next_action({"status": "ready"}), "render_report")
+
+    def test_evidence_and_deep_require_a_validated_logic_case(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Logic Case"):
+            logic_entry._require_logic_stage(
+                {"phase": "logic_draft", "status": "needs_logic"},
+                "evidence",
+            )
+        with self.assertRaisesRegex(ValueError, "定向补证"):
+            logic_entry._require_logic_stage(
+                {"phase": "logic_validated", "status": "needs_evidence"},
+                "deep",
+            )
+
     def test_explicit_evidence_kind_limits_requests(self) -> None:
         case = {
             "evidence_requests": [
@@ -76,6 +94,21 @@ class LogicEntryTest(unittest.TestCase):
             self.assertIn("Logic Case", rendered)
             self.assertIn("collector_only", rendered)
         self.assertNotIn("run analyze_a_share.py", codex)
+
+    def test_static_adapters_do_not_direct_users_to_legacy_entry(self) -> None:
+        claude = (ROOT / "adapters/claude/moda-companion.md").read_text(encoding="utf-8")
+        codex = (ROOT / "adapters/codex/moda-companion.toml").read_text(encoding="utf-8")
+        self.assertIn("analyze_logic.py", claude)
+        self.assertIn("analyze_logic.py", codex)
+        self.assertNotIn("run moda-companion/scripts/analyze_a_share.py", claude)
+        self.assertNotIn("run moda-companion/scripts/analyze_a_share.py", codex)
+
+    def test_openai_user_tools_exclude_legacy_bypass(self) -> None:
+        text = (ROOT / "adapters/openai/agent.py").read_text(encoding="utf-8")
+        tool_block = text.split("tools=[", 1)[1].split("],", 1)[0]
+        self.assertIn("analyze_logic", tool_block)
+        self.assertNotIn("analyze_a_share", tool_block)
+        self.assertNotIn("analyze_sector", tool_block)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@
 
 - 更新 `moda-companion` 单入口、OpenMinis 适配和内部 release updater，保持 moda-v4 为唯一事实采集与审计运行时。
 - 增加逻辑引擎、板块分析、证据边界和数据传输相关测试，继续保持 Windows、macOS、Linux 与 OpenMinis 的路径兼容。
+- 补上运行时状态机：返回 `next_action`，并阻止未校验 Logic Case 直接进入补证或深研；旧个股入口降为内部兼容路径。
 
 ## 2026-08-10
 
