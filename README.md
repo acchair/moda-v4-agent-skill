@@ -8,10 +8,10 @@
 
 ## 🚀 快速安装
 
-将下面的提示词交给Agent：
+将下面的提示词交给 Agent：
 
 ```text
-请将 https://github.com/acchair/moda-v4-agent-skill 安装为单入口“莫大 Agent”：克隆仓库、安装 requirements.txt，然后运行 moda-companion/install.py 对应平台安装器。只暴露 moda-companion；moda-v4 采集器和版本更新器放在内部，不要安装成独立用户 Skill。
+请从 https://github.com/acchair/moda-v4-agent-skill 克隆仓库并使用仓库默认分支。进入仓库根目录后运行 `python -m pip install -r requirements.txt`，再按当前平台运行对应安装器：Codex 使用 `python moda-companion/install.py codex --moda-root .`，Claude Code 使用 `python moda-companion/install.py claude --moda-root .`，OpenMinis 使用 `python3 moda-companion/install.py openminis --moda-root .`。安装结果只暴露 `moda-companion`；不要把 moda-v4 采集器或 release updater 安装成独立用户 Skill。
 ```
 
 也可以手动安装：
@@ -102,7 +102,7 @@ Hard Cap：
 板块问题使用独立的事实包和候选比较：产业趋势、供需、利润池、稀缺环节、利润兑现、概念与已计价，最后才输出证据排序。板块状态仅表示“值得研究 / 等待验证 / 暂不优先”，不等同个股五态或交易建议。
 
 ```powershell
-python moda-companion/install.py codex
+python moda-companion/install.py codex --moda-root .
 ```
 
 安装器会预置公开的莫大选股方法记忆，包括判断顺序、五类机会、五问过滤器、证据纪律、五态与 Hard Cap；重复安装不会覆盖用户已有记忆。安装后可用于行业、投资方法、AI/科技话题和日常陪伴，不保存账户、成本、持仓、联系方式、Cookie、密码、Token 或 API Key。
