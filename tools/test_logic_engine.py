@@ -185,6 +185,27 @@ class LogicEngineTest(unittest.TestCase):
         self.assertIn("## 下一步补什么证据", report)
         self.assertEqual(report.count("F1-F6"), 1)
 
+    def test_sector_report_labels_overseas_events_as_pending_domestic_validation(self) -> None:
+        case = logic_engine.new_logic_case("mRNA", "concept")
+        case["context"]["sector_broad_research"] = {
+            "overseas_event_radar": {
+                "summary": "海外事件只提供产业链待核验映射。",
+                "events": [{
+                    "event_type": "III期/关键临床读出",
+                    "event_priority": "P1",
+                    "catalyst_type": "产业催化",
+                    "mapping_status": "待A股主营、收入暴露与订单/利润核验",
+                    "title": "mRNA Phase 3 data",
+                    "a_share_validation": ["核对A股公司F10主营"],
+                }],
+            },
+        }
+
+        report = logic_engine.render_logic_case(case)
+
+        self.assertIn("## 海外增量到A股的映射", report)
+        self.assertIn("待A股主营、收入暴露与订单/利润核验", report)
+
 
 if __name__ == "__main__":
     unittest.main()

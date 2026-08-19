@@ -38,9 +38,7 @@ PUBLIC_SEARCH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 )
-DDG_HTML_URL = "https://html.duckduckgo.com/html/"
 DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
-SO360_SEARCH_URL = "https://www.so.com/s"
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 MAX_FETCH_BYTES = 600_000
 MAX_PDF_FETCH_BYTES = 10_000_000
@@ -99,11 +97,21 @@ STATUTORY_DOMAINS = ("cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn")
 FINANCE_MEDIA_DOMAINS = (
     "eastmoney.com", "10jqka.com.cn", "stcn.com", "cs.com.cn", "cnstock.com",
     "yicai.com", "cls.cn", "jrj.com.cn", "reuters.com", "bloomberg.com",
-    "news.cn", "sina.com.cn",
+    "news.cn", "sina.com.cn", "ft.com", "wsj.com", "cnbc.com", "nikkei.com",
 )
 RESEARCH_INSTITUTION_DOMAINS = (
     "cspengyuan.com", "seccw.com", "siscmag.com", "nepconasia.com",
     "fsemi.tech", "infoobs.com",
+)
+OVERSEAS_REGULATORY_DOMAINS = (
+    "sec.gov", "fda.gov", "clinicaltrials.gov", "eia.gov", "energy.gov", "defense.gov",
+    "usda.gov", "federalreserve.gov", "fred.stlouisfed.org", "bea.gov", "bls.gov",
+    "census.gov", "marad.dot.gov", "fao.org", "imf.org", "worldbank.org",
+)
+OVERSEAS_SECTOR_RESEARCH_DOMAINS = (
+    "trendforce.com", "semianalysis.com", "digitimes.com", "fiercebiotech.com", "endpts.com",
+    "biopharmadive.com", "spglobal.com", "argusmedia.com", "fastmarkets.com", "defensenews.com",
+    "breakingdefense.com", "lloydslist.com", "splash247.com", "agricensus.com",
 )
 CLUE_ONLY_DOMAINS = (
     "xueqiu.com", "guba.eastmoney.com", "caifuhao.eastmoney.com", "gw.com.cn", "dzh.com.cn",
@@ -257,8 +265,8 @@ def _load_local_env() -> None:
     if not path.exists():
         return
     allowed = {
-        "MODA_SEARCH_PROVIDER", "MODA_PUBLIC_SEARCH", "SEARXNG_URL", "DDG_MCP_URL",
-        "DDG_HTML_URL", "DDG_LITE_URL", "SO360_SEARCH_URL", "BRAVE_SEARCH_API_KEY", "BRAVE_SEARCH_URL",
+        "MODA_SEARCH_PROVIDER", "MODA_PUBLIC_SEARCH", "DDG_LITE_URL", "BRAVE_SEARCH_API_KEY", "BRAVE_SEARCH_URL",
+        "DEEPSEEK_API_KEY", "DEEPSEEK_ANTHROPIC_BASE_URL", "DEEPSEEK_WEB_SEARCH_MODEL",
         "MODA_MODEL_SEARCH_PROVIDER", "MODA_MODEL_SEARCH_URL",
         "MODA_MODEL_SEARCH_API_KEY", "MODA_MODEL_SEARCH_MODEL",
         "OPENAI_API_KEY", "OPENAI_WEB_SEARCH_MODEL", "OPENAI_RESPONSES_URL",
@@ -314,6 +322,8 @@ def _source_role(domain: str) -> tuple[str, str]:
         return "法定信息披露", "A"
     if _matches_domain(domain, CLUE_ONLY_DOMAINS):
         return "线索来源", "C"
+    if _matches_domain(domain, OVERSEAS_REGULATORY_DOMAINS):
+        return "海外监管/法定披露", "A"
     if _matches_domain(domain, OVERSEAS_FIRST_PARTY_DOMAINS):
         return "海外产业链一手资料", "A"
     if _matches_domain(domain, PATENT_STANDARD_DOMAINS):
@@ -324,6 +334,8 @@ def _source_role(domain: str) -> tuple[str, str]:
         return "财经媒体", "B"
     if _matches_domain(domain, RESEARCH_INSTITUTION_DOMAINS):
         return "行业研究", "B"
+    if _matches_domain(domain, OVERSEAS_SECTOR_RESEARCH_DOMAINS):
+        return "海外行业专业", "B"
     return "一般来源", "B"
 
 
@@ -332,11 +344,13 @@ def _search_rank(row: dict[str, Any]) -> tuple[int, int]:
     role, tier = _source_role(_domain(str(row.get("url") or "")))
     priority = {
         ("法定信息披露", "A"): 0,
+        ("海外监管/法定披露", "A"): 0,
         ("权威来源", "A"): 1,
         ("海外产业链一手资料", "A"): 1,
         ("技术/标准权威", "A"): 1,
         ("财经媒体", "B"): 2,
         ("行业研究", "B"): 2,
+        ("海外行业专业", "B"): 2,
         ("一般来源", "B"): 3,
         ("线索来源", "C"): 4,
     }.get((role, tier), 5)
@@ -655,24 +669,6 @@ def _safe_public_url(url: str) -> bool:
         return False
 
 
-def _response_payload(response: requests.Response) -> dict[str, Any]:
-    content_type = response.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
-        payloads: list[dict[str, Any]] = []
-        text = response.content.decode("utf-8", errors="replace")
-        for line in text.splitlines():
-            if line.startswith("data:"):
-                try:
-                    payloads.append(json.loads(line[5:].strip()))
-                except json.JSONDecodeError:
-                    continue
-        return next((payload for payload in reversed(payloads) if "result" in payload), payloads[-1] if payloads else {})
-    try:
-        return response.json()
-    except ValueError:
-        return {}
-
-
 def _http_session() -> requests.Session:
     session = getattr(_RUNTIME_LOCAL, "http_session", None)
     if session is None:
@@ -681,128 +677,10 @@ def _http_session() -> requests.Session:
     return session
 
 
-def _ddg_runtime(url: str, timeout: float) -> tuple[requests.Session, dict[str, str], int]:
-    runtime = getattr(_RUNTIME_LOCAL, "ddg_runtime", None)
-    if runtime and runtime[0] == url:
-        endpoint, session, headers, next_id = runtime
-        _RUNTIME_LOCAL.ddg_runtime = (endpoint, session, headers, next_id + 1)
-        return session, dict(headers), next_id
-
-    session = requests.Session()
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-    }
-    initialize = {
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "moda-v4", "version": "1.0"}},
-    }
-    response = session.post(url, json=initialize, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    session_id = response.headers.get("Mcp-Session-Id")
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
-    session.post(
-        url,
-        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-        headers=headers,
-        timeout=timeout,
-    ).raise_for_status()
-    _RUNTIME_LOCAL.ddg_runtime = (url, session, headers, 3)
-    return session, dict(headers), 2
-
-
-def _reset_ddg_runtime() -> None:
-    runtime = getattr(_RUNTIME_LOCAL, "ddg_runtime", None)
-    if runtime:
-        try:
-            runtime[1].close()
-        except Exception:
-            pass
-        delattr(_RUNTIME_LOCAL, "ddg_runtime")
-
-
-def _searxng_search(base_url: str, query: str, timeout: float) -> list[dict[str, Any]]:
-    response = _http_session().get(
-        base_url.rstrip("/") + "/search",
-        params={"q": query, "format": "json", "language": "zh-CN", "safesearch": 1},
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    rows = response.json().get("results", [])
-    return _prioritize_search_rows([
-        {
-            "title": str(row.get("title") or "").strip(),
-            "url": str(row.get("url") or "").strip(),
-            "snippet": str(row.get("content") or "").strip(),
-            "date": str(row.get("publishedDate") or "").strip(),
-            "engine": ",".join(row.get("engines") or [str(row.get("engine") or "")]),
-        }
-        for row in rows
-        if row.get("url")
-    ])[:8]
-
-
-def _parse_ddg_text(text: str) -> list[dict[str, Any]]:
-    pattern = re.compile(
-        r"(?:^|\n)(?:##\s*)?\d+\.\s*(.*?)\n\s*(?:\*\*)?URL:(?:\*\*)?\s*(\S+)"
-        r"(?:\n\s*(?:\*\*)?Summary:(?:\*\*)?\s*(.*?))?(?=\n\s*(?:##\s*)?\d+\.|\Z)",
-        re.S,
-    )
-    return _prioritize_search_rows([
-        {"title": title.strip(), "url": url.strip(), "snippet": (snippet or "").strip(), "date": "", "engine": "DuckDuckGo"}
-        for title, url, snippet in pattern.findall(text)
-    ])
-
-
-def _ddg_mcp_search(url: str, query: str, timeout: float) -> list[dict[str, Any]]:
-    session, headers, request_id = _ddg_runtime(url, timeout)
-    call = {
-        "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
-        "params": {"name": "search", "arguments": {"query": query, "max_results": 8, "region": "cn-zh"}},
-    }
-    response = session.post(url, json=call, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    payload = _response_payload(response)
-    blocks = payload.get("result", {}).get("content", [])
-    text = "\n".join(str(block.get("text") or "") for block in blocks if block.get("type") == "text")
-    return _parse_ddg_text(text)
-
-
 def _raise_if_search_blocked(response: requests.Response) -> None:
     text = response.text[:20_000].lower()
     if response.status_code == 202 or "anomaly" in text or "unusual traffic" in text:
         raise SearchBackendBlockedError("anti_bot")
-
-
-def _duckduckgo_html_search(query: str, timeout: float) -> list[dict[str, Any]]:
-    """Use DuckDuckGo's public HTML endpoint when no local service exists."""
-    response = _http_session().get(
-        os.getenv("DDG_HTML_URL", DDG_HTML_URL).strip() or DDG_HTML_URL,
-        params={"q": query, "kl": "cn-zh"},
-        headers={"User-Agent": PUBLIC_SEARCH_USER_AGENT, "Accept": "text/html"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    _raise_if_search_blocked(response)
-    pattern = re.compile(
-        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S
-    )
-    rows: list[dict[str, Any]] = []
-    for href, title_html in pattern.findall(response.text):
-        title = re.sub(r"<[^>]+>", " ", title_html)
-        title = re.sub(r"\s+", " ", title).strip()
-        parsed = urlparse(href)
-        if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
-            href = parse_qs(parsed.query).get("uddg", [""])[0] or href
-        if not href.startswith(("http://", "https://")):
-            continue
-        rows.append({"title": title, "url": href, "snippet": "", "date": "", "engine": "DuckDuckGo HTML"})
-        if len(rows) >= 8:
-            break
-    return _prioritize_search_rows(rows)
 
 
 def _duckduckgo_lite_search(query: str, timeout: float) -> list[dict[str, Any]]:
@@ -822,70 +700,16 @@ def _duckduckgo_lite_search(query: str, timeout: float) -> list[dict[str, Any]]:
         href_match = re.search(r'href=["\']([^"\']+)["\']', attrs, re.I)
         if not class_match or not href_match:
             continue
-        href = href_match.group(1)
-        title = re.sub(r"<[^>]+>", " ", title_html)
+        href = unescape(href_match.group(1))
+        title = unescape(re.sub(r"<[^>]+>", " ", title_html))
         title = re.sub(r"\s+", " ", title).strip()
-        parsed = urlparse(urljoin("https://lite.duckduckgo.com/lite/", href))
+        href = urljoin("https://lite.duckduckgo.com/lite/", href)
+        parsed = urlparse(href)
         if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
             href = parse_qs(parsed.query).get("uddg", [""])[0] or href
-        href = urljoin("https://lite.duckduckgo.com/lite/", href)
         if not href.startswith(("http://", "https://")):
             continue
         rows.append({"title": title, "url": href, "snippet": "", "date": "", "engine": "DuckDuckGo Lite"})
-        if len(rows) >= 8:
-            break
-    return _prioritize_search_rows(rows)
-
-
-def _html_text(value: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(value))).strip()
-
-
-def _so360_search(query: str, timeout: float) -> list[dict[str, Any]]:
-    """Search 360's public result page and retain its direct result URLs."""
-    endpoint = os.getenv("SO360_SEARCH_URL", SO360_SEARCH_URL).strip()
-    if not endpoint:
-        return []
-    response = _http_session().get(
-        endpoint,
-        params={"q": query},
-        headers={"User-Agent": PUBLIC_SEARCH_USER_AGENT, "Accept": "text/html"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    _raise_if_search_blocked(response)
-    rows: list[dict[str, Any]] = []
-    result_pattern = re.compile(
-        r'<li\b[^>]*class=["\'][^"\']*\bres-list\b[^"\']*["\'][^>]*>(.*?)</li>',
-        re.I | re.S,
-    )
-    for block in result_pattern.findall(response.text):
-        link = re.search(
-            r'<h3\b[^>]*class=["\'][^"\']*\bres-title\b[^"\']*["\'][^>]*>\s*'
-            r'<a\b([^>]*)>(.*?)</a>',
-            block,
-            re.I | re.S,
-        )
-        if not link:
-            continue
-        attributes, title_html = link.groups()
-        direct = re.search(r'\bdata-mdurl=["\']([^"\']+)["\']', attributes, re.I)
-        redirected = re.search(r'\bhref=["\']([^"\']+)["\']', attributes, re.I)
-        url = unescape((direct or redirected).group(1)) if direct or redirected else ""
-        if not url.startswith(("http://", "https://")):
-            continue
-        snippet_match = re.search(
-            r'<p\b[^>]*class=["\'][^"\']*\bres-desc\b[^"\']*["\'][^>]*>(.*?)</p>',
-            block,
-            re.I | re.S,
-        )
-        rows.append({
-            "title": _html_text(title_html),
-            "url": url,
-            "snippet": _html_text(snippet_match.group(1)) if snippet_match else "",
-            "date": "",
-            "engine": "360 Search",
-        })
         if len(rows) >= 8:
             break
     return _prioritize_search_rows(rows)
@@ -998,6 +822,75 @@ def _openai_web_search(query: str, timeout: float) -> list[dict[str, Any]]:
     return _response_search_rows(response.json())
 
 
+def _deepseek_web_search_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract only server-returned Web Search URLs from DeepSeek responses."""
+    rows: list[dict[str, Any]] = []
+    for block in payload.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "web_search_tool_result":
+            content = block.get("content") if isinstance(block.get("content"), list) else []
+            for source in content:
+                if not isinstance(source, dict) or not source.get("url"):
+                    continue
+                rows.append({
+                    "title": str(source.get("title") or _domain(str(source["url"])) or "DeepSeek 搜索来源"),
+                    "url": str(source["url"]),
+                    "snippet": str(source.get("cited_text") or "")[:500],
+                    "date": str(source.get("page_age") or ""),
+                    "engine": "DeepSeek Web Search",
+                })
+        for citation in block.get("citations") or []:
+            if not isinstance(citation, dict) or not citation.get("url"):
+                continue
+            rows.append({
+                "title": str(citation.get("title") or _domain(str(citation["url"])) or "DeepSeek 搜索引用"),
+                "url": str(citation["url"]),
+                "snippet": str(citation.get("cited_text") or "")[:500],
+                "date": "",
+                "engine": "DeepSeek Web Search",
+            })
+    seen: set[str] = set()
+    return _prioritize_search_rows([
+        row for row in rows if row["url"] not in seen and not seen.add(row["url"])
+    ])[:8]
+
+
+def _deepseek_web_search(query: str, timeout: float) -> list[dict[str, Any]]:
+    api_key = _secret("DEEPSEEK_API_KEY")
+    if not api_key:
+        return []
+    base_url = os.getenv("DEEPSEEK_ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic").strip().rstrip("/")
+    messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
+    payload: dict[str, Any] = {}
+    for _ in range(2):
+        response = _http_session().post(
+            base_url + "/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": os.getenv("DEEPSEEK_WEB_SEARCH_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash",
+                "max_tokens": 600,
+                "system": "只搜索公开网页并返回带 URL 的来源；不要把常识或未引用文字当作事实。",
+                "messages": messages,
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("stop_reason") != "pause_turn":
+            break
+        content = payload.get("content")
+        if not isinstance(content, list):
+            break
+        messages.append({"role": "assistant", "content": content})
+    return _deepseek_web_search_rows(payload)
+
+
 def _model_search_bridge(query: str, timeout: float) -> list[dict[str, Any]]:
     url = os.getenv("MODA_MODEL_SEARCH_URL", "").strip()
     if not url:
@@ -1040,14 +933,15 @@ def _model_search_bridge(query: str, timeout: float) -> list[dict[str, Any]]:
     return _prioritize_search_rows(rows)[:8]
 
 
-def _model_search(query: str, timeout: float) -> tuple[str, list[dict[str, Any]], list[str]]:
-    selected = os.getenv("MODA_MODEL_SEARCH_PROVIDER", "auto").strip().lower()
+def _model_search(provider: str, query: str, timeout: float) -> tuple[str, list[dict[str, Any]], list[str]]:
     errors: list[str] = []
-    providers = []
-    if selected in {"auto", "bridge", "deepseek"} and os.getenv("MODA_MODEL_SEARCH_URL", "").strip():
-        providers.append(("model_search_bridge", _model_search_bridge))
-    if selected in {"auto", "openai"} and _secret("OPENAI_API_KEY"):
+    providers: list[tuple[str, Any]] = []
+    if provider in {"auto", "model", "deepseek"}:
+        providers.append(("deepseek_web_search", _deepseek_web_search))
+    if provider in {"auto", "model", "openai"}:
         providers.append(("openai_web_search", _openai_web_search))
+    if provider in {"auto", "model", "bridge"} and os.getenv("MODA_MODEL_SEARCH_URL", "").strip():
+        providers.append(("model_search_bridge", _model_search_bridge))
     if not providers:
         return "none", [], ["model_search:not_configured"]
     for name, search in providers:
@@ -1063,10 +957,11 @@ def _model_search(query: str, timeout: float) -> tuple[str, list[dict[str, Any]]
 
 def _search_backend_label(provider: str) -> str:
     return {
-        "so360": "360搜索",
         "brave": "Brave Search",
-        "searxng": "SearXNG",
         "duckduckgo": "DuckDuckGo",
+        "deepseek": "DeepSeek Web Search",
+        "openai": "OpenAI Web Search",
+        "bridge": "模型搜索网关",
         "model": "模型搜索",
         "auto": "已配置搜索后端",
     }.get(provider, "当前搜索后端")
@@ -1080,19 +975,7 @@ def _search(provider: str, query: str, timeout: float, cache_scope: str = "") ->
         if cached and cached.get("date") == datetime.now().date().isoformat() and cached.get("rows"):
             return str(cached.get("used") or "none"), list(cached.get("rows") or []), []
     errors: list[str] = []
-    searxng = os.getenv("SEARXNG_URL", "").strip()
-    ddg = os.getenv("DDG_MCP_URL", "").strip()
-    if provider in {"auto", "searxng"} and searxng:
-        try:
-            rows = _searxng_search(searxng, query, timeout)
-            if rows:
-                if cache_key:
-                    _save_search_cache(cache_key, "searxng", rows)
-                return "searxng", rows, errors
-            errors.append("searxng:no_results")
-        except Exception as exc:
-            errors.append(f"searxng:{type(exc).__name__}")
-    if provider in {"auto", "brave"} and _secret("BRAVE_SEARCH_API_KEY"):
+    if provider == "brave" and _secret("BRAVE_SEARCH_API_KEY"):
         try:
             rows = _brave_search(query, timeout)
             if rows:
@@ -1102,41 +985,7 @@ def _search(provider: str, query: str, timeout: float, cache_scope: str = "") ->
             errors.append("brave:no_results")
         except Exception as exc:
             errors.append(f"brave:{type(exc).__name__}")
-    public_search = os.getenv("MODA_PUBLIC_SEARCH", "auto").strip().lower()
-    so360 = os.getenv("SO360_SEARCH_URL", SO360_SEARCH_URL).strip()
-    if provider in {"auto", "so360"} and public_search not in {"0", "false", "off", "no"} and so360:
-        try:
-            rows = _so360_search(query, timeout)
-            if rows:
-                if cache_key:
-                    _save_search_cache(cache_key, "so360", rows)
-                return "so360", rows, errors
-            errors.append("so360:no_results")
-        except Exception as exc:
-            detail = str(exc) if isinstance(exc, SearchBackendBlockedError) else type(exc).__name__
-            errors.append(f"so360:{detail}")
-    if provider in {"auto", "duckduckgo"} and ddg:
-        try:
-            rows = _ddg_mcp_search(ddg, query, timeout)
-            if rows:
-                if cache_key:
-                    _save_search_cache(cache_key, "duckduckgo", rows)
-                return "duckduckgo", rows, errors
-            errors.append("duckduckgo:no_results")
-        except Exception as exc:
-            _reset_ddg_runtime()
-            errors.append(f"duckduckgo:{type(exc).__name__}")
-    if provider in {"auto", "duckduckgo"} and public_search not in {"0", "false", "off", "no"}:
-        try:
-            rows = _duckduckgo_html_search(query, timeout)
-            if rows:
-                if cache_key:
-                    _save_search_cache(cache_key, "duckduckgo_html", rows)
-                return "duckduckgo_html", rows, errors
-            errors.append("duckduckgo_html:no_results")
-        except Exception as exc:
-            detail = str(exc) if isinstance(exc, SearchBackendBlockedError) else type(exc).__name__
-            errors.append(f"duckduckgo_html:{detail}")
+    if provider in {"auto", "duckduckgo"}:
         try:
             rows = _duckduckgo_lite_search(query, timeout)
             if rows:
@@ -1147,15 +996,14 @@ def _search(provider: str, query: str, timeout: float, cache_scope: str = "") ->
         except Exception as exc:
             detail = str(exc) if isinstance(exc, SearchBackendBlockedError) else type(exc).__name__
             errors.append(f"duckduckgo_lite:{detail}")
-    model_search_enabled = os.getenv("MODA_MODEL_SEARCH_PROVIDER", "auto").strip().lower() not in {"0", "false", "off", "no"}
-    if provider in {"auto", "model"} and model_search_enabled:
-        used, rows, model_errors = _model_search(query, timeout)
+    if provider in {"auto", "deepseek", "openai", "model", "bridge"}:
+        used, rows, model_errors = _model_search(provider, query, timeout)
         errors.extend(model_errors)
         if rows:
             if cache_key:
                 _save_search_cache(cache_key, used, rows)
             return used, rows, errors
-    if not searxng and not ddg and not errors:
+    if not errors:
         errors.append("search_backend_not_configured")
     return "none", [], errors
 
@@ -1163,12 +1011,14 @@ def _search(provider: str, query: str, timeout: float, cache_scope: str = "") ->
 def _search_cache_key(provider: str, query: str, cache_scope: str = "") -> str:
     configured = "|".join((
         provider,
-        os.getenv("SEARXNG_URL", "").strip(),
-        os.getenv("DDG_MCP_URL", "").strip(),
+        os.getenv("DDG_LITE_URL", DDG_LITE_URL).strip(),
         os.getenv("BRAVE_SEARCH_URL", BRAVE_SEARCH_URL).strip(),
+        os.getenv("DEEPSEEK_ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic").strip(),
+        os.getenv("DEEPSEEK_WEB_SEARCH_MODEL", "deepseek-v4-flash").strip(),
         os.getenv("MODA_MODEL_SEARCH_PROVIDER", "auto").strip(),
         os.getenv("MODA_MODEL_SEARCH_URL", "").strip(),
         os.getenv("MODA_MODEL_SEARCH_MODEL", "").strip(),
+        os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses").strip(),
         os.getenv("OPENAI_WEB_SEARCH_MODEL", "").strip(),
     ))
     return sha256(f"{cache_scope}|{configured}|{query.strip()}".encode("utf-8")).hexdigest()
@@ -1359,11 +1209,11 @@ def _collect_gap_target(
         query_timeout = min(timeout, max(0.2, remaining / queries_left))
         used, rows, query_errors = _search(provider, query, query_timeout, cache_scope=f"{code}|{key}")
         relevant = [row for row in rows if _gap_relevant(row, key, code, name, context)]
-        if used == "searxng" and not relevant and provider == "auto" and os.getenv("DDG_MCP_URL", "").strip():
+        if used == "duckduckgo_lite" and not relevant and provider == "auto":
             fallback_remaining = min(deadline, target_deadline) - time.monotonic()
             fallback_timeout = min(timeout, max(0.2, fallback_remaining / 2)) if fallback_remaining >= 0.2 else 0
             fallback_used, fallback_rows, fallback_errors = (
-                _search("duckduckgo", query, fallback_timeout, cache_scope=f"{code}|{key}")
+                _search("model", query, fallback_timeout, cache_scope=f"{code}|{key}")
                 if fallback_timeout > 0 else (
                     "none",
                     [],
@@ -2346,7 +2196,7 @@ def collect_sector_evidence(
     if not sector_name:
         raise ValueError("sector 不能为空")
     selected = (provider or os.getenv("MODA_SEARCH_PROVIDER", "auto")).strip().lower()
-    if selected not in {"auto", "searxng", "brave", "duckduckgo", "so360", "model", "off"}:
+    if selected not in {"auto", "brave", "duckduckgo", "deepseek", "openai", "model", "bridge", "off"}:
         selected = "off"
     if selected == "off":
         return {
@@ -2418,7 +2268,7 @@ def collect(code: str, name: str, context: str, provider: str | None = None, tim
             targets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     _reset_run_snapshot()
     selected = (provider or os.getenv("MODA_SEARCH_PROVIDER", "auto")).strip().lower()
-    if selected not in {"auto", "searxng", "brave", "duckduckgo", "so360", "model", "off"}:
+    if selected not in {"auto", "brave", "duckduckgo", "deepseek", "openai", "model", "bridge", "off"}:
         selected = "off"
     if selected == "off":
         return {"web_research_status": "disabled", "web_research_provider": "off", "queries": [], "results": [], "errors": []}

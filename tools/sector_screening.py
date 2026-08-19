@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
 import json
 from pathlib import Path
 import re
+from statistics import median
 from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from tools.data_call import dataframe_empty, run_with_timeout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +31,8 @@ DEFAULT_BUSINESS_TIMEOUT = 4
 DEFAULT_PEER_SNAPSHOT_WORKERS = 1
 DEFAULT_PEER_SNAPSHOT_TIMEOUT = 5
 DEFAULT_PEER_SNAPSHOT_LIMIT = 30
+DEFAULT_SECTOR_MARKET_HISTORY_DAYS = 60
+DEFAULT_SECTOR_MARKET_TIMEOUT = 5
 
 # These terms only create a *clue*.  A confirmed technical barrier still
 # requires primary disclosure, customer certification, process data, or a
@@ -288,6 +294,7 @@ def _load_eastmoney_universe(sector: str) -> tuple[list[dict[str, Any]], dict[st
 
         boards = _safe_records(ak.stock_board_industry_name_em())
         board_name = _pick_board_name(boards, sector)
+        board = next((row for row in boards if _text(_first(row, "板块名称", "名称", "行业名称", "name")) == board_name), {})
         if not board_name:
             return [], {
                 "source": "AKShare/东方财富行业板块成分股",
@@ -307,6 +314,7 @@ def _load_eastmoney_universe(sector: str) -> tuple[list[dict[str, Any]], dict[st
             "source": "AKShare/东方财富行业板块成分股",
             "coverage_status": "live_full",
             "board_name": board_name,
+            "board_symbol": _text(_first(board, "板块代码", "代码", "code")),
             "selection_note": "按实时行业成分股覆盖候选池；主营与产业链位置仍需轻量核验。",
         }
     except Exception as exc:
@@ -336,6 +344,12 @@ def _load_eastmoney_concept_universe(sector: str) -> tuple[list[dict[str, Any]],
             }
         boards = _safe_records(board_fetcher())
         board_names = _pick_board_names(boards, sector, limit=MAX_THEME_CONCEPT_BOARDS)
+        board_symbols = [
+            _text(_first(row, "板块代码", "代码", "code"))
+            for name in board_names
+            for row in boards
+            if _text(_first(row, "板块名称", "名称", "name")) == name
+        ]
         if not board_names:
             return [], {
                 "source": "AKShare/东方财富概念板块成分股",
@@ -369,6 +383,7 @@ def _load_eastmoney_concept_universe(sector: str) -> tuple[list[dict[str, Any]],
             "source": "AKShare/东方财富概念板块成分股",
             "coverage_status": "live_theme",
             "board_names": board_names,
+            "board_symbols": board_symbols,
             "selection_note": "按概念板块构建主题候选池，不代表完整行业样本；概念命中必须经主营、收入或公告核验。",
             "partial_errors": errors,
         }
@@ -531,6 +546,198 @@ def resolve_sector_universe(
             else "行业成分股接口不可用，已降级到本地部分名单。"
         )
     return local_rows, local_metadata
+
+
+def _market_quote_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "code": _code(_first(row, "股票代码", "代码", "证券代码", "code")),
+        "name": _text(_first(row, "股票名称", "名称", "证券简称", "name")),
+        "pct_chg": _number(_first(row, "涨跌幅", "涨跌幅(%)", "pct_chg", "change_percent")),
+        "amount": _number(_first(row, "成交额", "amount")),
+        "turnover": _number(_first(row, "换手率", "turnover")),
+    }
+
+
+def _market_breadth(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    quotes = [_market_quote_row(row) for row in rows]
+    quotes = [row for row in quotes if row["code"] and row["pct_chg"] is not None]
+    changes = [float(row["pct_chg"]) for row in quotes]
+    return {
+        "valid_count": len(quotes),
+        "advancing": sum(value > 0 for value in changes),
+        "declining": sum(value < 0 for value in changes),
+        "flat": sum(value == 0 for value in changes),
+        "mean_pct_chg": round(sum(changes) / len(changes), 4) if changes else None,
+        "median_pct_chg": round(float(median(changes)), 4) if changes else None,
+        "total_amount": round(sum(float(row["amount"] or 0) for row in quotes), 2) if quotes else None,
+        "leaders": sorted(quotes, key=lambda row: float(row["pct_chg"] or 0), reverse=True)[:3],
+        "laggards": sorted(quotes, key=lambda row: float(row["pct_chg"] or 0))[:3],
+    }
+
+
+def _board_history_return(rows: Sequence[Mapping[str, Any]]) -> float | None:
+    closes = [_number(_first(row, "收盘", "收盘价", "close")) for row in rows]
+    values = [value for value in closes if value is not None]
+    if len(values) < 2 or values[0] == 0:
+        return None
+    return round((values[-1] / values[0] - 1) * 100, 4)
+
+
+def _board_spot_values(frame: Any) -> dict[str, Any]:
+    """AKShare board spot frames are key/value rows, not a one-row quote."""
+    rows = _safe_records(frame)
+    if rows and all("item" in row and "value" in row for row in rows):
+        return {_text(row.get("item")): row.get("value") for row in rows}
+    return rows[0] if rows else {}
+
+
+def collect_sector_market_snapshot(
+    sector: str,
+    universe: Sequence[Mapping[str, Any]],
+    universe_metadata: Mapping[str, Any],
+    *,
+    query_kind: str,
+    fetch: bool,
+    history_days: int = DEFAULT_SECTOR_MARKET_HISTORY_DAYS,
+) -> dict[str, Any]:
+    """Collect a non-decisive board/constituent market snapshot.
+
+    AKShare is the primary Eastmoney board source.  efinance and easy-tdx are
+    separately reported fallbacks/side snapshots; aggregated data wrappers do
+    not count as independent corroboration.
+    """
+    if not fetch:
+        return {"fetch_state": "not_requested", "source_chain": [], "errors": []}
+    board_name = _text(universe_metadata.get("board_name"))
+    if not board_name:
+        names = universe_metadata.get("board_names")
+        board_name = _text(names[0]) if isinstance(names, Sequence) and not isinstance(names, str) and names else ""
+    board_symbol = _text(universe_metadata.get("board_symbol"))
+    if not board_symbol:
+        symbols = universe_metadata.get("board_symbols")
+        board_symbol = _text(symbols[0]) if isinstance(symbols, Sequence) and not isinstance(symbols, str) and symbols else ""
+    board_query = board_symbol or board_name
+    source_chain: list[dict[str, Any]] = []
+    errors: list[str] = []
+    board: dict[str, Any] = {"name": board_name or "需人工确认"}
+    breadth: dict[str, Any] = {"valid_count": 0, "leaders": [], "laggards": []}
+    fund_flow: dict[str, Any] = {}
+
+    akshare_ok = False
+    try:
+        import akshare as ak
+
+        if board_query:
+            spot_fn = ak.stock_board_concept_spot_em if query_kind == "concept" else ak.stock_board_industry_spot_em
+            spot_result = run_with_timeout(
+                "板块实时行情", lambda: spot_fn(symbol=board_query), seconds=DEFAULT_SECTOR_MARKET_TIMEOUT,
+                source="AKShare/东方财富板块行情", empty=dataframe_empty,
+            )
+            if spot_result.ok:
+                spot = _board_spot_values(spot_result.value)
+                board["spot"] = {
+                    "latest": _number(_first(spot, "最新", "最新价", "收盘")),
+                    "pct_chg": _number(_first(spot, "涨跌幅", "涨跌幅(%)")),
+                    "amount": _number(_first(spot, "成交额")),
+                    "turnover": _number(_first(spot, "换手率")),
+                }
+                akshare_ok = True
+            elif spot_result.error:
+                errors.append(f"akshare_spot:{spot_result.error}")
+
+            history_fn = ak.stock_board_concept_hist_em if query_kind == "concept" else ak.stock_board_industry_hist_em
+            end = date.today()
+            history_result = run_with_timeout(
+                "板块历史行情",
+                lambda: history_fn(
+                    symbol=board_query,
+                    period="daily" if query_kind == "concept" else "日k",
+                    start_date=(end - timedelta(days=max(30, int(history_days * 2)))).strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                    adjust="",
+                ),
+                seconds=DEFAULT_SECTOR_MARKET_TIMEOUT,
+                source="AKShare/东方财富板块历史", empty=dataframe_empty,
+            )
+            if history_result.ok:
+                board["history_days"] = history_days
+                board["history_return_pct"] = _board_history_return(_safe_records(history_result.value))
+                akshare_ok = True
+            elif history_result.error:
+                errors.append(f"akshare_history:{history_result.error}")
+        if query_kind == "sector":
+            flow_result = run_with_timeout(
+                "行业资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="5日", sector_type="行业资金流"),
+                seconds=DEFAULT_SECTOR_MARKET_TIMEOUT,
+                source="AKShare/东方财富行业资金流", empty=dataframe_empty,
+            )
+            flow_rows = _safe_records(flow_result.value) if flow_result.ok else []
+            match = next((row for row in flow_rows if _matches_sector(_first(row, "名称", "行业", "板块名称"), board_name or sector)), {})
+            if match:
+                fund_flow = {
+                    "window": "5日",
+                    "main_net_inflow": _number(_first(match, "主力净流入-净额", "主力净流入", "5日主力净流入")),
+                    "main_net_inflow_pct": _number(_first(match, "主力净流入-净占比", "主力净流入占比")),
+                    "rank": _number(_first(match, "序号", "排名")),
+                }
+                akshare_ok = True
+            elif flow_result.error:
+                errors.append(f"akshare_fund_flow:{flow_result.error}")
+        source_chain.append({"source": "AKShare/东方财富板块行情", "fetch_state": "ok" if akshare_ok else "failed", "independent_corroboration": False})
+    except Exception as exc:
+        errors.append(f"akshare_board:{type(exc).__name__}")
+        source_chain.append({"source": "AKShare/东方财富板块行情", "fetch_state": "failed", "independent_corroboration": False})
+
+    try:
+        from tools.efinance.provider import _load_efinance
+
+        quote_result = run_with_timeout(
+            "全市场批量行情", lambda: _load_efinance().stock.get_realtime_quotes(),
+            seconds=DEFAULT_SECTOR_MARKET_TIMEOUT,
+            source="efinance/全市场批量行情", empty=dataframe_empty,
+        )
+        quote_rows = _safe_records(quote_result.value) if quote_result.ok else []
+        if not quote_result.ok and quote_result.error:
+            errors.append(f"efinance_quotes:{quote_result.error}")
+        codes = {_code(row.get("code")) for row in universe}
+        selected = [row for row in quote_rows if _code(_first(row, "股票代码", "代码", "证券代码", "code")) in codes]
+        breadth = _market_breadth(selected)
+        source_chain.append({"source": "efinance/全市场批量行情", "fetch_state": "ok" if breadth["valid_count"] else quote_result.fetch_state, "independent_corroboration": False})
+    except Exception as exc:
+        errors.append(f"efinance_quotes:{type(exc).__name__}")
+        source_chain.append({"source": "efinance/全市场批量行情", "fetch_state": "failed", "independent_corroboration": False})
+
+    try:
+        from tools.providers.easy_tdx_provider import fetch_board_ranking
+
+        ranking_result = run_with_timeout(
+            "通达信板块排行", fetch_board_ranking, seconds=DEFAULT_SECTOR_MARKET_TIMEOUT,
+            source="easy-tdx/通达信板块排行", empty=dataframe_empty,
+        )
+        ranking_rows = _safe_records(ranking_result.value) if ranking_result.ok else []
+        if not ranking_result.ok and ranking_result.error:
+            errors.append(f"easy_tdx_board:{ranking_result.error}")
+        match = next((row for row in ranking_rows if _matches_sector(_first(row, "名称", "板块名称", "name"), board_name or sector)), {})
+        board["tdx_ranking"] = {
+            "name": _text(_first(match, "名称", "板块名称", "name")),
+            "pct_chg": _number(_first(match, "涨跌幅", "pct_chg")),
+            "rank": _number(_first(match, "排名", "序号", "rank")),
+        } if match else {}
+        source_chain.append({"source": "easy-tdx/通达信板块排行", "fetch_state": "ok" if match else ranking_result.fetch_state, "independent_corroboration": False})
+    except Exception as exc:
+        errors.append(f"easy_tdx_board:{type(exc).__name__}")
+        source_chain.append({"source": "easy-tdx/通达信板块排行", "fetch_state": "failed", "independent_corroboration": False})
+
+    states = {_text(item.get("fetch_state")) for item in source_chain}
+    return {
+        "fetch_state": "ok" if "ok" in states and source_chain[0].get("fetch_state") == "ok" else "fallback_ok" if "ok" in states else "empty" if states == {"empty"} else "failed",
+        "board": board,
+        "breadth": breadth,
+        "fund_flow": fund_flow,
+        "source_chain": source_chain,
+        "errors": errors,
+        "note": "板块行情仅描述市场状态；efinance 与 AKShare 等聚合源不作为独立交叉验证，也不进入个股排序。",
+    }
 
 
 def _default_business_fetcher(code: str, timeout: int) -> dict[str, Any]:
@@ -1113,6 +1320,7 @@ def screen_sector(
     peer_snapshot_workers: int = DEFAULT_PEER_SNAPSHOT_WORKERS,
     peer_snapshot_limit: int = DEFAULT_PEER_SNAPSHOT_LIMIT,
     peer_snapshot_fetcher: Callable[[str, int], Mapping[str, Any]] | None = None,
+    fetch_market_snapshot: bool | None = None,
     shortlist_limit: int = DEFAULT_SHORTLIST_LIMIT,
     query_kind: str = "auto",
 ) -> dict[str, Any]:
@@ -1139,6 +1347,13 @@ def screen_sector(
         query_kind=resolved_query_kind,
     )
     universe_metadata["query_kind"] = resolved_query_kind
+    market_snapshot = collect_sector_market_snapshot(
+        sector,
+        universe,
+        universe_metadata,
+        query_kind=resolved_query_kind,
+        fetch=use_live_universe if fetch_market_snapshot is None else bool(fetch_market_snapshot),
+    )
     businesses = collect_business_snapshots(
         universe,
         fetch=fetch_business,
@@ -1223,6 +1438,7 @@ def screen_sector(
         "sector": sector,
         "query_kind": resolved_query_kind,
         "universe": {**universe_metadata, **coverage},
+        "market_snapshot": market_snapshot,
         "selection_rules": [
             "先覆盖可获得的全量行业成分股；行业成分股、主营嵌入和主题关联分开处理。"
             if resolved_query_kind == "sector"
@@ -1234,6 +1450,7 @@ def screen_sector(
             "产业链上游、核心设备、材料、工艺、认证和关键位置只在有 F10 或静态资料线索时优先；线索不等于壁垒已验证。",
             "价格位置、利润趋势和股东筹码用于相对比较，不汇总成综合分，也不生成买卖结论。",
             "AKShare/东财同行规模排名只在主营、壁垒、生存、位置和利润条件相同的候选之间作透明末级排序；不把它当成完整同行池或公司优劣证明。",
+            "板块市场快照使用 AKShare/东方财富、efinance 和 easy-tdx 的行情字段；仅展示市场状态，不参与公司排序，也不作为独立交叉验证。",
             "前六仅是优先深研名单；完整个股流水线必须等待用户确认。",
         ],
         "shortlist": shortlist,
@@ -1323,6 +1540,25 @@ def render_quick_screen(payload: Mapping[str, Any]) -> str:
         lines.append(f"- 数据降级：{_cell(universe.get('live_fallback'))}")
     if universe.get("error"):
         lines.append(f"- 数据状态：{_cell(universe.get('error'))}；结果按可获得候选展示，不把缺失写成行业事实。")
+    market = payload.get("market_snapshot") if isinstance(payload.get("market_snapshot"), Mapping) else {}
+    if market.get("fetch_state") != "not_requested":
+        board = market.get("board") if isinstance(market.get("board"), Mapping) else {}
+        board_spot = board.get("spot") if isinstance(board.get("spot"), Mapping) else {}
+        breadth = market.get("breadth") if isinstance(market.get("breadth"), Mapping) else {}
+        leaders = breadth.get("leaders") if isinstance(breadth.get("leaders"), list) else []
+        laggards = breadth.get("laggards") if isinstance(breadth.get("laggards"), list) else []
+        def quote_text(items: Sequence[Mapping[str, Any]]) -> str:
+            return "、".join(
+                f"{_cell(item.get('name') or item.get('code'))} {_display_number(item.get('pct_chg'))}%"
+                for item in items if isinstance(item, Mapping)
+            ) or "需人工确认"
+        lines += [
+            "", "## 板块市场快照", "",
+            f"- 状态：{_cell(market.get('fetch_state'))}；板块：{_cell(board.get('name'))}；当日涨跌幅：{_display_number(board_spot.get('pct_chg'))}%；约 {board.get('history_days', '—')} 日区间：{_display_number(board.get('history_return_pct'))}% 。",
+            f"- 成分广度：有效 {breadth.get('valid_count', 0)} 家，上涨 {breadth.get('advancing', 0)} / 下跌 {breadth.get('declining', 0)} / 平盘 {breadth.get('flat', 0)}；中位涨跌幅 {_display_number(breadth.get('median_pct_chg'))}% 。",
+            f"- 领涨：{quote_text(leaders)}；领跌：{quote_text(laggards)}。",
+            "- 说明：这是市场状态，不进入优先名单排序；同源聚合行情不构成独立交叉验证。",
+        ]
     lines += ["", "## 快速筛选口径", ""]
     lines.extend(f"- {_cell(item)}" for item in payload.get("selection_rules", []))
     lines += ["", "## 前六：优先深研候选", ""]

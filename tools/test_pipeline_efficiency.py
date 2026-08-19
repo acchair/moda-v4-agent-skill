@@ -261,7 +261,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         row = {"title": "中石科技讨论", "snippet": "可能订单恢复", "url": "https://example.test"}
         with patch.object(stock_discussion, "_xueqiu", return_value=[]), \
              patch.object(stock_discussion, "_eastmoney", return_value=[]), \
-             patch.object(stock_discussion, "_search", return_value=("searxng", [row], [])):
+             patch.object(stock_discussion, "_search", return_value=("duckduckgo_lite", [row], [])):
             data = stock_discussion.collect("300684", "中石科技")
         self.assertEqual(data["discussion_search_count"], 1)
         self.assertEqual(data["discussion_records"][0]["status"], "网络命中（未核验）")
@@ -376,7 +376,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
             {"title": "行业订单增长、业绩改善、行业指数上涨", "snippet": "资金流入，成交放量", "url": "https://static.cninfo.com.cn/a"},
             {"title": "行业复苏与价格上涨", "snippet": "排产饱满，跑赢市场", "url": "https://www.cls.cn/a"},
         ]
-        with patch.object(web_research, "_search", return_value=("duckduckgo_html", rows, [])), \
+        with patch.object(web_research, "_search", return_value=("duckduckgo_lite", rows, [])), \
              patch.object(web_research, "_fetch_page", return_value=("ok", "")):
             result = industry_prosperity.collect_web_signal("华特气体", "电子化学品", timeout=0.1)
         self.assertEqual(result["status"], "上行")
@@ -524,137 +524,43 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(metrics["operating_cashflow_to_net_profit"], 1.2)
         self.assertEqual(metrics["receivables_to_assets"], 0.1)
 
-    def test_search_auto_prefers_searxng_and_falls_back_to_ddg(self) -> None:
+    def test_search_auto_prefers_duckduckgo_lite(self) -> None:
         row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example", "SO360_SEARCH_URL": ""}, clear=False), \
-             patch.object(web_research, "_searxng_search", return_value=row), \
-             patch.object(web_research, "_ddg_mcp_search") as ddg:
-            used, rows, _ = web_research._search("auto", "test", 0.1)
-        self.assertEqual((used, rows), ("searxng", row))
-        ddg.assert_not_called()
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "https://ddg.example", "SO360_SEARCH_URL": ""}, clear=False), \
-             patch.object(web_research, "_searxng_search", side_effect=TimeoutError), \
-             patch.object(web_research, "_ddg_mcp_search", return_value=row):
+        with patch.dict(os.environ, {"MODA_PUBLIC_SEARCH": "auto"}, clear=False), \
+             patch.object(web_research, "_duckduckgo_lite_search", return_value=row), \
+             patch.object(web_research, "_deepseek_web_search") as deepseek:
             used, rows, errors = web_research._search("auto", "test", 0.1)
-        self.assertEqual((used, rows), ("duckduckgo", row))
-        self.assertIn("searxng:TimeoutError", errors)
+        self.assertEqual((used, rows, errors), ("duckduckgo_lite", row, []))
+        deepseek.assert_not_called()
 
-    def test_search_public_falls_back_to_duckduckgo_lite(self) -> None:
-        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
-        with patch.dict(
-            os.environ,
-            {
-                "SEARXNG_URL": "",
-                "DDG_MCP_URL": "",
-                "SO360_SEARCH_URL": "",
-                "MODA_PUBLIC_SEARCH": "auto",
-            },
-            clear=False,
-        ), patch.object(web_research, "_duckduckgo_html_search", side_effect=TimeoutError), \
-                patch.object(web_research, "_duckduckgo_lite_search", return_value=row):
+    def test_search_falls_back_to_deepseek_when_lite_is_empty(self) -> None:
+        row = [{"title": "公告", "url": "https://www.cninfo.com.cn/a", "snippet": "测试"}]
+        with patch.dict(os.environ, {"MODA_PUBLIC_SEARCH": "auto", "DEEPSEEK_API_KEY": "unit-test-key", "OPENAI_API_KEY": ""}, clear=False), \
+             patch.object(web_research, "_duckduckgo_lite_search", return_value=[]), \
+             patch.object(web_research, "_deepseek_web_search", return_value=row):
             used, rows, errors = web_research._search("auto", "test", 0.1)
-        self.assertEqual((used, rows), ("duckduckgo_lite", row))
-        self.assertIn("duckduckgo_html:TimeoutError", errors)
+        self.assertEqual((used, rows), ("deepseek_web_search", row))
+        self.assertIn("duckduckgo_lite:no_results", errors)
 
-    def test_search_public_prefers_so360_when_it_returns_direct_results(self) -> None:
-        row = [{"title": "测试", "url": "https://www.cninfo.com.cn/a", "snippet": "测试"}]
-        with patch.dict(os.environ, {
-            "SEARXNG_URL": "", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "auto",
-            "SO360_SEARCH_URL": "https://search.example",
-        }, clear=False), patch.object(web_research, "_so360_search", return_value=row):
-            used, rows, errors = web_research._search("auto", "test", 0.1)
-        self.assertEqual((used, rows, errors), ("so360", row, []))
-
-    def test_gap_search_reuses_only_same_day_success(self) -> None:
+    def test_gap_search_cache_reuses_same_day_lite_success(self) -> None:
         row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
-             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", return_value=row) as search:
+             patch.object(web_research, "_duckduckgo_lite_search", return_value=row) as search:
             first = web_research._search("auto", "测试查询", 0.1, cache_scope="000001|F1.era_track")
             second = web_research._search("auto", "测试查询", 0.1, cache_scope="000001|F1.era_track")
         self.assertEqual(first, second)
         search.assert_called_once()
 
-    def test_gap_search_does_not_cache_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
-             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", return_value=[]) as search:
-            web_research._search("auto", "失败查询", 0.1, cache_scope="000001|F1.era_track")
-            web_research._search("auto", "失败查询", 0.1, cache_scope="000001|F1.era_track")
-        self.assertEqual(search.call_count, 2)
-
-    def test_gap_search_cache_scope_separates_stocks_and_factors(self) -> None:
+    def test_search_cache_can_be_disabled_for_refresh(self) -> None:
         row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
-             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", return_value=row) as search:
-            web_research._search("auto", "同一查询", 0.1, cache_scope="000001|F1.era_track")
-            web_research._search("auto", "同一查询", 0.1, cache_scope="000002|F1.era_track")
-            web_research._search("auto", "同一查询", 0.1, cache_scope="000001|F1.supply_gap")
-        self.assertEqual(search.call_count, 3)
-
-    def test_gap_search_cache_can_be_disabled_for_refresh(self) -> None:
-        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
-             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off", "MODA_SEARCH_CACHE": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", return_value=row) as search:
+             patch.dict(os.environ, {"MODA_SEARCH_CACHE": "off"}, clear=False), \
+             patch.object(web_research, "_duckduckgo_lite_search", return_value=row) as search:
             web_research._search("auto", "刷新查询", 0.1, cache_scope="000001|F1.era_track")
             web_research._search("auto", "刷新查询", 0.1, cache_scope="000001|F1.era_track")
         self.assertEqual(search.call_count, 2)
-
-    def test_search_cache_batch_flushes_once_for_multiple_successes(self) -> None:
-        row = [{"title": "测试", "url": "https://example.com", "snippet": "测试"}]
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.object(web_research, "CACHE_PATH", Path(directory) / "search.json"), \
-             patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", return_value=row), \
-             patch.object(web_research, "_flush_search_cache", wraps=web_research._flush_search_cache) as flush:
-            with web_research._search_cache_batch():
-                web_research._search("auto", "查询一", 0.1, cache_scope="000001|F1.era_track")
-                web_research._search("auto", "查询二", 0.1, cache_scope="000001|F1.supply_gap")
-        flush.assert_called_once()
-
-    def test_ddg_mcp_session_initializes_once_per_worker(self) -> None:
-        calls: list[str] = []
-
-        class FakeResponse:
-            headers = {"Mcp-Session-Id": "session-1"}
-            content = b""
-
-            def __init__(self, payload: dict | None = None) -> None:
-                self.payload = payload or {}
-
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> dict:
-                return self.payload
-
-        class FakeSession:
-            def post(self, _url: str, *, json: dict, headers: dict, timeout: float) -> FakeResponse:
-                calls.append(str(json.get("method") or ""))
-                if json.get("method") == "tools/call":
-                    query = json["params"]["arguments"]["query"]
-                    payload = {"result": {"content": [{"type": "text", "text": f"1. {query}\nURL: https://example.com/{query}"}]}}
-                    return FakeResponse(payload)
-                return FakeResponse()
-
-            def close(self) -> None:
-                pass
-
-        web_research._reset_ddg_runtime()
-        with patch.object(web_research.requests, "Session", return_value=FakeSession()):
-            first = web_research._ddg_mcp_search("https://ddg.example", "first", 0.1)
-            second = web_research._ddg_mcp_search("https://ddg.example", "second", 0.1)
-        web_research._reset_ddg_runtime()
-        self.assertEqual(calls.count("initialize"), 1)
-        self.assertEqual(calls.count("notifications/initialized"), 1)
-        self.assertEqual(calls.count("tools/call"), 2)
-        self.assertEqual([first[0]["title"], second[0]["title"]], ["first", "second"])
 
     def test_page_snapshot_reuses_only_successful_content(self) -> None:
         successful = [("ok", "正文")]
@@ -682,7 +588,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
 
         def fake_search(_provider: str, query: str, _timeout: float, cache_scope: str = ""):
             calls.append((cache_scope, query))
-            return "duckduckgo_html", [], []
+            return "test", [], []
 
         with patch.object(web_research, "_search", side_effect=fake_search), \
              patch.object(web_research, "MAX_GAP_BUDGET_SECONDS", 30.0):
@@ -1234,7 +1140,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(evidence["chain_name"], "半导体电子特气产业链")
         self.assertEqual(evidence["chain_stage"], "upstream")
         self.assertTrue(evidence["chain_partial"])
-        self.assertIn("SearXNG + 360 搜索 + DuckDuckGo + 带引用的模型搜索", evidence["metric_sources"]["chain_name"])
+        self.assertIn("DuckDuckGo Lite + DeepSeek/OpenAI Web Search + 带引用的模型搜索", evidence["metric_sources"]["chain_name"])
 
     def test_unconfirmed_business_revenue_caps_chain_match(self) -> None:
         data = full_evidence()
@@ -1388,18 +1294,18 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertNotIn("网页", catalyst.reason)
 
     def test_search_timeout_and_http_error_degrade_cleanly(self) -> None:
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", side_effect=TimeoutError):
+        with patch.dict(os.environ, {"MODA_PUBLIC_SEARCH": "auto", "DEEPSEEK_API_KEY": "", "OPENAI_API_KEY": "", "MODA_MODEL_SEARCH_URL": ""}, clear=False), \
+             patch.object(web_research, "_duckduckgo_lite_search", side_effect=TimeoutError):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual(used, "none")
         self.assertEqual(rows, [])
-        self.assertIn("searxng:TimeoutError", errors)
+        self.assertIn("duckduckgo_lite:TimeoutError", errors)
 
-        with patch.dict(os.environ, {"SEARXNG_URL": "https://search.example", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off"}, clear=False), \
-             patch.object(web_research, "_searxng_search", side_effect=requests.HTTPError("403 Forbidden")):
+        with patch.dict(os.environ, {"MODA_PUBLIC_SEARCH": "auto", "DEEPSEEK_API_KEY": "", "OPENAI_API_KEY": "", "MODA_MODEL_SEARCH_URL": ""}, clear=False), \
+             patch.object(web_research, "_duckduckgo_lite_search", side_effect=requests.HTTPError("403 Forbidden")):
             used, rows, errors = web_research._search("auto", "test", 0.1)
         self.assertEqual((used, rows), ("none", []))
-        self.assertIn("searxng:HTTPError", errors)
+        self.assertIn("duckduckgo_lite:HTTPError", errors)
 
     def test_pdf_text_reader_stops_at_page_limit(self) -> None:
         pages = [SimpleNamespace(extract_text=lambda value=str(index): value) for index in range(web_research.MAX_PDF_PAGES + 3)]
@@ -1454,18 +1360,18 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertTrue(receive_connection.closed)
         self.assertTrue(send_connection.closed)
 
-    def test_public_search_fallback_is_used_without_local_backend(self) -> None:
+    def test_public_search_fallback_uses_duckduckgo_lite(self) -> None:
         row = [{"title": "公开搜索结果", "url": "https://example.com", "snippet": "测试"}]
-        with patch.dict(os.environ, {"SEARXNG_URL": "", "DDG_MCP_URL": "", "SO360_SEARCH_URL": "", "MODA_PUBLIC_SEARCH": "auto"}, clear=False), \
-             patch.object(web_research, "_duckduckgo_html_search", return_value=row):
+        with patch.dict(os.environ, {"MODA_PUBLIC_SEARCH": "auto"}, clear=False), \
+             patch.object(web_research, "_duckduckgo_lite_search", return_value=row):
             used, rows, errors = web_research._search("auto", "test", 0.1)
-        self.assertEqual((used, rows), ("duckduckgo_html", row))
+        self.assertEqual((used, rows), ("duckduckgo_lite", row))
         self.assertEqual(errors, [])
 
     def test_model_search_bridge_is_last_resort_and_requires_urls(self) -> None:
         cited = [{"title": "公告", "url": "https://www.cninfo.com.cn/a", "snippet": "原文"}]
         with patch.dict(os.environ, {
-            "SEARXNG_URL": "", "DDG_MCP_URL": "", "MODA_PUBLIC_SEARCH": "off",
+            "MODA_PUBLIC_SEARCH": "off", "DEEPSEEK_API_KEY": "", "OPENAI_API_KEY": "",
             "MODA_MODEL_SEARCH_PROVIDER": "bridge", "MODA_MODEL_SEARCH_URL": "https://model-search.example",
         }, clear=False), patch.object(web_research, "_model_search_bridge", return_value=cited):
             used, rows, _ = web_research._search("auto", "test", 0.1)
@@ -1501,9 +1407,14 @@ class PipelineEfficiencyTest(unittest.TestCase):
         rows = [{"sw_second_name": "软件开发", "sw_second_code": "801080", "sw_first_code": "801080"}]
         self.assertEqual(congestion._map_industry("软件服务", rows)["status"], "已验证")
 
-    def test_duckduckgo_mcp_numbered_results_are_parsed(self) -> None:
-        text = "Found 2 search results:\n\n1. 标题一\n   URL: https://example.com/a\n   Summary: 摘要一\n\n2. 标题二\n   URL: https://example.org/b\n   Summary: 摘要二\n"
-        rows = web_research._parse_ddg_text(text)
+    def test_deepseek_server_results_are_parsed(self) -> None:
+        rows = web_research._deepseek_web_search_rows({"content": [{
+            "type": "web_search_tool_result",
+            "content": [
+                {"title": "标题一", "url": "https://example.com/a", "cited_text": "摘要一"},
+                {"title": "标题二", "url": "https://example.org/b", "cited_text": "摘要二"},
+            ],
+        }]})
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["title"], "标题一")
         self.assertEqual(rows[1]["url"], "https://example.org/b")
@@ -1817,7 +1728,7 @@ class PipelineEfficiencyTest(unittest.TestCase):
         self.assertEqual(evidence["capex_strength"], 0.5)
         self.assertTrue(evidence["capex_partial"])
         self.assertNotIn("easy_tdx/CNINFO + AKShare/CNINFO", evidence["metric_sources"]["capex_strength"])
-        self.assertIn("SearXNG + 360 搜索 + DuckDuckGo + 带引用的模型搜索", evidence["metric_sources"]["capex_strength"])
+        self.assertIn("DuckDuckGo Lite + DeepSeek/OpenAI Web Search + 带引用的模型搜索", evidence["metric_sources"]["capex_strength"])
 
 if __name__ == "__main__":
     unittest.main()

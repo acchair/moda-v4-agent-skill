@@ -87,14 +87,14 @@ class SocialSourceQualityTest(unittest.TestCase):
             "date": "2026-07-14",
         }
         with patch.object(news_sentiment, "collect", return_value=structured), \
-             patch("tools.scoring.web_research._search", return_value=("so360", [candidate], [])) as search:
+             patch("tools.scoring.web_research._search", return_value=("duckduckgo_lite", [candidate], [])) as search:
             data = social_sentiment._collect_news("600641", "先导基电", ["先导基电", "600641"])
 
         self.assertEqual(data["news_posts_total"], 0)
         self.assertIsNone(data["news_sentiment"])
         self.assertEqual(data["news_search_count"], 1)
         self.assertEqual(data["news_search_records"][0]["status"], "网络候选新闻（未核验）")
-        self.assertEqual(data["news_search_records"][0]["provider"], "so360")
+        self.assertEqual(data["news_search_records"][0]["provider"], "duckduckgo_lite")
         self.assertEqual(search.call_args.args[1], "先导基电 600641 新闻 公告")
 
     def test_news_search_is_not_run_when_realtime_news_matches(self) -> None:
@@ -117,7 +117,7 @@ class SocialSourceQualityTest(unittest.TestCase):
         self.assertEqual(data["news_search_fetch_state"], "not_run")
 
     def test_news_search_failure_is_not_reported_as_no_match(self) -> None:
-        with patch("tools.scoring.web_research._search", return_value=("none", [], ["so360:SSLError"])):
+        with patch("tools.scoring.web_research._search", return_value=("none", [], ["duckduckgo_lite:SSLError"])):
             data = social_sentiment._collect_news_candidates("600641", "先导基电")
 
         self.assertEqual(data["news_search_count"], 0)
@@ -125,7 +125,7 @@ class SocialSourceQualityTest(unittest.TestCase):
         self.assertEqual(data["news_search_status"], "搜索失败，需人工确认")
 
     def test_news_search_explicit_no_result_is_reported_as_empty(self) -> None:
-        with patch("tools.scoring.web_research._search", return_value=("none", [], ["so360:no_results"])):
+        with patch("tools.scoring.web_research._search", return_value=("none", [], ["duckduckgo_lite:no_results"])):
             data = social_sentiment._collect_news_candidates("600641", "先导基电")
 
         self.assertEqual(data["news_search_fetch_state"], "empty")
@@ -157,10 +157,10 @@ class SocialSourceQualityTest(unittest.TestCase):
             "news_sentiment": None,
             "news_search_count": 1,
             "news_search_status": "网络候选新闻（未核验）",
-            "news_search_provider": "so360",
+            "news_search_provider": "duckduckgo_lite",
             "news_search_query": "先导基电 600641 新闻 公告",
             "news_search_records": [{
-                "provider": "so360",
+                "provider": "duckduckgo_lite",
                 "title": "先导基电（600641）公告",
                 "url": "https://example.com/600641",
             }],

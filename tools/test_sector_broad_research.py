@@ -13,7 +13,7 @@ class SectorBroadResearchTest(unittest.TestCase):
             del cache_scope
             domain = query.split("site:", 1)[1].split()[0] if "site:" in query else "example.com"
             query_id = abs(hash(query))
-            return "duckduckgo_html", [
+            return "duckduckgo_lite", [
                 {"title": f"端侧AI 资料 {index}", "url": f"https://{domain}/{query_id}/article-{index}", "snippet": "端侧AI 技术路线", "date": ""}
                 for index in range(1, 7)
             ], []
@@ -27,13 +27,14 @@ class SectorBroadResearchTest(unittest.TestCase):
              patch.object(broad.web, "_search_cache_batch") as cache_batch:
             cache_batch.return_value.__enter__.return_value = None
             cache_batch.return_value.__exit__.return_value = None
-            result = broad.collect_sector_broad_evidence("端侧AI", provider="model", raw_url_limit=120, body_page_limit=100)
+            result = broad.collect_sector_broad_evidence("端侧AI", provider="model", raw_url_limit=100, body_page_limit=100)
         self.assertGreaterEqual(result["audit"]["query_executed"], broad.MIN_QUERY_COVERAGE)
         self.assertLessEqual(result["audit"]["query_executed"], result["audit"]["query_planned"])
-        self.assertEqual(result["audit"]["raw_result_count"], 120)
-        self.assertEqual(result["audit"]["raw_url_count"], 120)
-        self.assertEqual(result["audit"]["body_attempted"], 100)
-        self.assertEqual(result["audit"]["body_readable"], 100)
+        self.assertGreaterEqual(result["audit"]["raw_result_count"], 36)
+        self.assertLessEqual(result["audit"]["raw_url_count"], 100)
+        self.assertEqual(result["audit"]["body_attempted"], result["audit"]["raw_url_count"])
+        self.assertEqual(result["audit"]["body_readable"], result["audit"]["body_attempted"])
+        self.assertIn(result["audit"]["early_stop_reason"], {"candidate_source_coverage", "raw_url_target"})
         self.assertGreater(result["audit"]["usable_evidence_count"], 0)
 
     def test_resolved_board_and_f10_business_drive_queries_before_source_shortcuts(self) -> None:
@@ -60,9 +61,10 @@ class SectorBroadResearchTest(unittest.TestCase):
         self.assertEqual(entity["query_kind"], "concept")
         self.assertEqual(entity["board_names"], ["先进封装"])
         self.assertEqual(entity["constituent_count"], 42)
-        self.assertEqual(plan[0]["bucket"], "实体校准")
-        self.assertIn("测试设备", plan[0]["query"])
-        self.assertIn("晶圆级封装设备与检测系统", plan[0]["query"])
+        entity_query = next(item for item in plan if item["bucket"] == "实体校准")
+        self.assertIn("测试设备", entity_query["query"])
+        self.assertIn("晶圆级封装设备与检测系统", entity_query["query"])
+        self.assertEqual(plan[0]["bucket"], "海外增量雷达")
         self.assertFalse(any("nvidia.com" in item["query"] for item in plan))
 
     def test_eda_and_material_profiles_add_sector_specific_sources_after_entity_split(self) -> None:
@@ -97,7 +99,8 @@ class SectorBroadResearchTest(unittest.TestCase):
                 "EDA板块", provider="model", raw_url_limit=2, body_page_limit=1, screening=screening,
             )
 
-        self.assertEqual(result["query_plan"][0]["domain_hint"], "semi.org")
+        self.assertEqual(result["query_plan"][0]["bucket"], "海外增量雷达")
+        self.assertTrue(any(item["domain_hint"] == "semi.org" for item in result["query_plan"]))
         self.assertGreaterEqual(result["audit"]["query_executed"], broad.MIN_QUERY_COVERAGE)
         self.assertGreaterEqual(len(result["audit"]["query_dimension_coverage"]), broad.MIN_DIMENSION_COVERAGE)
         self.assertEqual(result["web_research_status"], "completed")
@@ -105,6 +108,32 @@ class SectorBroadResearchTest(unittest.TestCase):
     def test_generic_summary_never_claims_a_sector_conclusion(self) -> None:
         result = broad.collect_sector_broad_evidence("端侧AI", provider="off")
         self.assertIn("未将空结果解释为行业事实", result["summary"])
+        self.assertEqual(result["overseas_event_radar"]["status"], "disabled")
+
+    def test_body_verified_overseas_event_stays_a_domestic_validation_template(self) -> None:
+        plan = broad.build_query_plan("mRNA")
+        sources = [{
+            "bucket": "海外增量雷达",
+            "title": "mRNA cancer vaccine Phase 3 trial reports data",
+            "url": "https://clinicaltrials.gov/mrna-phase-3",
+            "snippet": "Phase 3 study",
+            "content_excerpt": "mRNA cancer vaccine Phase 3 pivotal trial clinical data.",
+            "fetch_status": "ok",
+            "body_scope_match": True,
+            "source_role": "海外监管/法定披露",
+            "source_tier": "A",
+            "date": "2026-08-20",
+        }]
+
+        radar = broad._build_overseas_event_radar("mRNA", "", plan, sources)
+
+        self.assertEqual(radar["status"], "body_verified_events")
+        event = radar["events"][0]
+        self.assertEqual(event["event_type"], "III期/关键临床读出")
+        self.assertEqual(event["catalyst_type"], "产业催化")
+        self.assertEqual(event["a_share_mapping_priority"], "中")
+        self.assertEqual(event["mapping_status"], "待A股主营、收入暴露与订单/利润核验")
+        self.assertTrue(any("F10" in item for item in event["a_share_validation"]))
 
     def test_brave_backend_collects_paginated_pages(self) -> None:
         def brave(_query: str, _timeout: float, count: int, offset: int):

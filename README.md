@@ -75,7 +75,7 @@ Hard Cap：
 
 搜索结果按来源分级：巨潮资讯、沪深北交易所等法定信息披露正文可作为高确信度证据；雪球、东方财富、大智慧等金融论坛只用于收集线索，不参与确认或计分。
 
-搜索补缺默认按 `SearXNG → DuckDuckGo MCP → DuckDuckGo HTML/Lite → 带引用模型搜索` 回退。首轮覆盖所有 F1-F5 缺口，并按公司、产业、产业链、利润兑现、市场预期选择来源类型；只有正文可读、对象匹配且来源合理的结果才成为未核验线索。模型搜索可使用 OpenAI Responses `web_search`，或通过 `MODA_MODEL_SEARCH_URL` 接入返回 URL 的 DeepSeek/其他搜索网关；普通 Chat API 生成的无引用文本不会进入证据。配置示例见 `.env.example`，真实 API Key 只放本地 `.env`，不要提交仓库。
+搜索补缺默认使用 `DuckDuckGo Lite → DeepSeek Web Search → OpenAI Web Search → 可选模型网关`。首轮覆盖所有 F1-F5 缺口，并按公司、产业、产业链、利润兑现、市场预期选择来源类型；只有正文可读、对象匹配且来源合理的结果才成为未核验线索。OpenAI 和 DeepSeek 都由代码显式请求联网工具；普通 Chat API 生成的无引用文本不会进入证据。板块轻筛另取 AKShare/东财板块行情、efinance 成分股广度与 easy-tdx 板块排行，只描述市场状态，不参与公司排序。配置示例见 `.env.example`，真实 API Key 只放本地 `.env`，不要提交仓库。
 
 ### 🧾 输出格式
 

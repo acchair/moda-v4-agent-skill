@@ -229,7 +229,7 @@ def _apply_web_fallback(factor: FactorResult, evidence: dict[str, Any]) -> Facto
             web_score = _bounded(_number(result.get("score")) or 0, 0, item.maximum)
             score = web_score if item.status == "需人工确认" else max(item.score, web_score)
             provider = str(result.get("provider") or "web")
-            source = "SearXNG（未核验）" if provider == "searxng" else "DuckDuckGo MCP（未核验）" if provider == "duckduckgo" else "网络搜索（未核验）"
+            source = "DuckDuckGo Lite（未核验）" if provider == "duckduckgo_lite" else "模型联网搜索（未核验）" if provider in {"deepseek_web_search", "openai_web_search"} else "网络搜索（未核验）"
             reason = f"{item.reason}；网络补缺：{result.get('reason', '命中搜索线索')}" if item.status == "部分覆盖" else str(result.get("reason") or item.reason)
             sources = tuple(dict.fromkeys((*item.sources, source)))
             coverage = max(item.coverage, 0.5)

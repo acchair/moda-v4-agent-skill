@@ -295,7 +295,7 @@ def collect(code: str, name: str, timeout: float = 8) -> dict[str, Any]:
     fetch_state = "fallback_ok" if structured and structured_partial else "ok" if structured else "fallback_ok" if records else "empty" if only_no_results else "failed"
     source_chain = [xueqiu_status, eastmoney_status]
     if not structured:
-        source_chain.append({"source": "SearXNG/DuckDuckGo", "status": "ok" if records else "failed" if search_errors and not only_no_results else "empty", "error": "; ".join(search_errors)})
+        source_chain.append({"source": "DuckDuckGo Lite/带引用模型搜索", "status": "ok" if records else "failed" if search_errors and not only_no_results else "empty", "error": "; ".join(search_errors)})
     return {
         "discussion_posts_total": len(records),
         "discussion_structured_count": structured_count,
@@ -321,7 +321,7 @@ def build_report(code: str, name: str, data: dict[str, Any]) -> str:
     lines = [
         f"# 个股讨论与情绪：{name}（{code}）",
         "",
-        f"> 采集时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  来源：雪球/东方财富公开接口；失败后 SearXNG → DuckDuckGo MCP",
+        f"> 采集时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  来源：雪球/东方财富公开接口；失败后 DuckDuckGo Lite → 带引用模型搜索",
         "",
         f"<!-- moda_stock_discussion: {json.dumps(data, ensure_ascii=False)} -->",
         "",

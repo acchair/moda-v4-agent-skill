@@ -71,6 +71,16 @@ class SectorSearchPlannerTest(unittest.TestCase):
         self.assertEqual(entity["coverage_status"], "local_partial")
         self.assertIn("ConnectionError", entity["live_resolution_error"])
 
+    def test_mrna_uses_a_compact_life_science_overseas_radar(self) -> None:
+        plan = planner.build_broad_query_plan("mRNA")
+        radar = [item for item in plan if item["bucket"] == "海外增量雷达"]
+
+        self.assertEqual(len(radar), 4)
+        self.assertEqual([item["domain_hint"] for item in radar[:3]], [
+            "fda.gov", "clinicaltrials.gov", "sec.gov",
+        ])
+        self.assertTrue(all(item["dimension"] == "overseas_event" for item in radar))
+
 
 if __name__ == "__main__":
     unittest.main()

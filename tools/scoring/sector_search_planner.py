@@ -24,6 +24,77 @@ GENERIC_QUERY_BUCKETS: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
 )
 
 
+# This is a discovery catalogue, not a list of evidence providers.  A broad
+# research run selects only the few domains relevant to the resolved sector,
+# then still requires a readable body and the domestic A-share checks below.
+OVERSEAS_INTELLIGENCE_SOURCE_CATALOG: tuple[dict[str, Any], ...] = (
+    {
+        "id": "life_science",
+        "label": "生命科学/生物医药",
+        "terms": ("mrna", "生物医药", "创新药", "疫苗", "cxo", "临床", "医药", "医疗", "生物"),
+        "sources": ("fda.gov", "clinicaltrials.gov", "sec.gov", "fiercebiotech.com", "reuters.com"),
+        "event_hint": "FDA approval breakthrough therapy phase 2 phase 3 clinical data licensing acquisition biotech funding",
+        "mapping_chain": "海外临床/审批/交易 → 技术路线验证 → 测序生信、原料递送、研发服务、制造环节（均待A股主营与订单核验）",
+    },
+    {
+        "id": "semiconductor_ai",
+        "label": "半导体/AI基础设施",
+        "terms": ("半导体", "芯片", "eda", "封装", "晶圆", "光刻", "算力", "ai", "服务器", "数据中心"),
+        "sources": ("sec.gov", "trendforce.com", "semianalysis.com", "digitimes.com", "reuters.com"),
+        "event_hint": "earnings guidance capex capacity bookings orders product roadmap supply chain",
+        "mapping_chain": "海外资本开支/产品路线 → 需求与供给变化 → 设备、材料、设计工具、封装或基础设施环节（均待A股主营与订单核验）",
+    },
+    {
+        "id": "energy_materials",
+        "label": "能源/金属/化工",
+        "terms": ("能源", "石油", "天然气", "煤", "电力", "储能", "锂", "铜", "金属", "化工", "材料"),
+        "sources": ("eia.gov", "sec.gov", "spglobal.com", "argusmedia.com", "reuters.com"),
+        "event_hint": "inventory production capacity price capex supply demand contract",
+        "mapping_chain": "海外供需/库存/资本开支 → 商品或关键原料价格与采购变化 → 资源、材料、设备或加工环节（均待A股主营与订单核验）",
+    },
+    {
+        "id": "defense",
+        "label": "军工/航空航天",
+        "terms": ("军工", "国防", "航空", "航天", "卫星", "无人机", "导弹", "雷达"),
+        "sources": ("defense.gov", "sec.gov", "defensenews.com", "breakingdefense.com", "reuters.com"),
+        "event_hint": "procurement budget contract production program supply chain",
+        "mapping_chain": "海外预算/采购/型号进度 → 供应链需求变化 → 材料、部件、装备或信息化环节（均待A股主营与订单核验）",
+    },
+    {
+        "id": "shipping",
+        "label": "航运/物流",
+        "terms": ("航运", "集运", "港口", "物流", "船舶", "运价", "集装箱"),
+        "sources": ("marad.dot.gov", "lloydslist.com", "splash247.com", "sec.gov", "reuters.com"),
+        "event_hint": "freight rate demand fleet capacity port congestion orderbook",
+        "mapping_chain": "海外运价/运力/港口变化 → 运输与造船链景气变化 → 航运、港口、船舶或配套环节（均待A股主营与订单核验）",
+    },
+    {
+        "id": "agriculture",
+        "label": "农业/食品",
+        "terms": ("农业", "种业", "粮食", "饲料", "农药", "化肥", "食品", "玉米", "大豆"),
+        "sources": ("usda.gov", "fao.org", "agricensus.com", "sec.gov", "reuters.com"),
+        "event_hint": "crop forecast acreage yield inventory export price fertilizer demand",
+        "mapping_chain": "海外种植/库存/贸易变化 → 农产品与投入品供需变化 → 种业、农资、饲料或加工环节（均待A股主营与订单核验）",
+    },
+    {
+        "id": "macro_finance",
+        "label": "宏观/金融",
+        "terms": ("宏观", "利率", "通胀", "汇率", "地产", "银行", "保险", "券商"),
+        "sources": ("federalreserve.gov", "fred.stlouisfed.org", "bea.gov", "bls.gov", "reuters.com"),
+        "event_hint": "rate inflation employment GDP credit liquidity earnings guidance",
+        "mapping_chain": "海外宏观变量变化 → 风险偏好、资本成本或外需变化 → A股行业需求与估值变量（需单独验证传导）",
+    },
+    {
+        "id": "general",
+        "label": "通用全球财经",
+        "terms": (),
+        "sources": ("sec.gov", "reuters.com", "cnbc.com", "ft.com", "nikkei.com"),
+        "event_hint": "earnings guidance capex orders acquisition licensing funding supply demand",
+        "mapping_chain": "海外事件 → 产业变量变化 → A股具体供给环节（必须先验证主营、收入暴露与订单）",
+    },
+)
+
+
 SECTOR_PROFILES: tuple[dict[str, Any], ...] = (
     {
         "id": "eda",
@@ -282,6 +353,50 @@ def _business_archetype(entity_context: Mapping[str, Any]) -> tuple[str, tuple[s
     return "general", ("需求驱动 供给约束 价格 库存 产能", "技术路线 竞争格局 利润池 商业兑现")
 
 
+def overseas_event_profile(
+    sector: str,
+    context: str = "",
+    *,
+    entity_context: Mapping[str, Any] | None = None,
+    profile_id: str = "generic",
+) -> dict[str, Any]:
+    """Select a compact overseas event radar for a sector expression.
+
+    The returned chain is deliberately a *validation template*.  It says
+    which domestic links need testing; it does not identify beneficiaries or
+    claim an A-share earnings impact.
+    """
+    entity = dict(entity_context or {})
+    archetype, _ = _business_archetype(entity)
+    haystack = " ".join((
+        _text(sector), _text(context), _text(profile_id), archetype,
+        " ".join(_as_phrases(entity.get("board_names"))),
+        " ".join(_as_phrases(entity.get("business_phrases"))),
+    )).lower()
+    for item in OVERSEAS_INTELLIGENCE_SOURCE_CATALOG:
+        if item["id"] == "life_science" and archetype == "healthcare":
+            return dict(item)
+        if item["id"] == "semiconductor_ai" and profile_id in {"eda", "semiconductor_materials"}:
+            return dict(item)
+        if any(term in haystack for term in item["terms"]):
+            return dict(item)
+    return next(dict(item) for item in OVERSEAS_INTELLIGENCE_SOURCE_CATALOG if item["id"] == "general")
+
+
+def _overseas_event_queries(
+    sector: str,
+    context: str,
+    entity_context: Mapping[str, Any],
+    profile_id: str,
+) -> tuple[dict[str, Any], tuple[tuple[str, str, str, str, str], ...]]:
+    profile = overseas_event_profile(sector, context, entity_context=entity_context, profile_id=profile_id)
+    sources = tuple(str(domain) for domain in profile["sources"][:4])
+    return profile, tuple(
+        ("海外增量雷达", "overseas_event", "neutral", domain, str(profile["event_hint"]))
+        for domain in sources
+    )
+
+
 def _dynamic_queries(entity_context: Mapping[str, Any]) -> tuple[tuple[str, str, str, str, str], ...]:
     boards = _as_phrases(entity_context.get("board_names"))[:3]
     companies = [
@@ -349,9 +464,16 @@ def build_broad_query_plan(
             "profile_label": profile_label,
         })
 
+    # The overseas radar is run first after local entity resolution.  It is
+    # intentionally narrow (four sources, selected by sector), so it can find
+    # overnight increments without turning broad search into an all-site sweep.
+    _, overseas_queries = _overseas_event_queries(theme, context_text, resolved_entity, profile_id)
+    for bucket, dimension, stance, domain, hint in overseas_queries:
+        append(bucket, dimension, stance, domain, hint)
+
     # A known source profile is a shortcut after entity resolution, not an
-    # entity substitute.  Put its primary/industry sources before broad open
-    # discovery so low-quality results cannot exhaust the URL target first.
+    # entity substitute.  It follows the compact overseas event scan and stays
+    # ahead of broad open discovery.
     if profile:
         for bucket, dimension, stance, domain, hint in profile["broad_queries"]:
             append(bucket, dimension, stance, domain, hint)

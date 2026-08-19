@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tools.sector_screening as screening
@@ -142,6 +143,40 @@ class SectorQuickScreenTest(unittest.TestCase):
         self.assertEqual(rows[0]["code"], "000001")
         self.assertEqual(metadata["coverage_status"], "live_full")
         self.assertEqual(metadata["primary_fallback"], "东方财富失败")
+
+    def test_market_snapshot_uses_board_history_breadth_and_tdx_without_ranking_companies(self) -> None:
+        class FakeAk:
+            @staticmethod
+            def stock_board_industry_spot_em(symbol: str):
+                return __import__("pandas").DataFrame([{"最新": 1200, "涨跌幅": 1.2, "成交额": 100}])
+
+            @staticmethod
+            def stock_board_industry_hist_em(**_kwargs):
+                return __import__("pandas").DataFrame([{"收盘": 100}, {"收盘": 110}])
+
+            @staticmethod
+            def stock_sector_fund_flow_rank(**_kwargs):
+                return __import__("pandas").DataFrame([{"名称": "通用设备", "主力净流入-净额": 10, "序号": 3}])
+
+        quotes = __import__("pandas").DataFrame([
+            {"股票代码": "000001", "股票名称": "甲", "涨跌幅": 3.0, "成交额": 20},
+            {"股票代码": "000002", "股票名称": "乙", "涨跌幅": -1.0, "成交额": 10},
+        ])
+        fake_ef = SimpleNamespace(stock=SimpleNamespace(get_realtime_quotes=lambda: quotes))
+        with patch.dict("sys.modules", {"akshare": FakeAk}), \
+             patch("tools.efinance.provider._load_efinance", return_value=fake_ef), \
+             patch("tools.providers.easy_tdx_provider.fetch_board_ranking", return_value=__import__("pandas").DataFrame([
+                 {"名称": "通用设备", "涨跌幅": 1.1, "排名": 4}
+             ])):
+            snapshot = screening.collect_sector_market_snapshot(
+                "通用设备", [{"code": "000001"}, {"code": "000002"}], {"board_name": "通用设备"},
+                query_kind="sector", fetch=True,
+            )
+        self.assertEqual(snapshot["fetch_state"], "ok")
+        self.assertEqual(snapshot["board"]["history_return_pct"], 10.0)
+        self.assertEqual(snapshot["breadth"]["advancing"], 1)
+        self.assertEqual(snapshot["breadth"]["declining"], 1)
+        self.assertEqual(snapshot["board"]["tdx_ranking"]["rank"], 4.0)
 
     def test_theme_aliases_use_concept_components_as_a_candidate_pool(self) -> None:
         boards = [

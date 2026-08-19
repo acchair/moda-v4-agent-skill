@@ -107,7 +107,7 @@ def collect_web_signal(name: str, industry: str, timeout: float = 10) -> dict[st
     layers: dict[str, Any] = {}
     errors: list[str] = []
     provider = os.getenv("MODA_SEARCH_PROVIDER", "auto").strip().lower()
-    if provider not in {"auto", "searxng", "duckduckgo", "so360", "model"}:
+    if provider not in {"auto", "brave", "duckduckgo", "deepseek", "openai", "model", "bridge"}:
         provider = "auto"
     for key, query in queries.items():
         layer = INDUSTRY_WEB_LAYERS[key]

@@ -30,7 +30,7 @@ SOURCE_LABELS = {
     "congestion": "乐咕乐股/申万二级行业拥挤度",
     "social_sentiment": "公开社交热榜 + 个股讨论接口/搜索 + 财经快讯",
     "macro_policy": "AKShare/PBOC + gov.cn",
-    "web_research": "SearXNG + 360 搜索 + DuckDuckGo + 带引用的模型搜索",
+    "web_research": "DuckDuckGo Lite + DeepSeek/OpenAI Web Search + 带引用的模型搜索",
     "industry_prosperity": "乐咕乐股(B级) + AKShare/申万",
 }
 REPORTS = tuple(SOURCE_LABELS)

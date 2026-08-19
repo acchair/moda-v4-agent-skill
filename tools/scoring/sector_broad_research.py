@@ -21,7 +21,7 @@ from tools.scoring import sector_search_planner
 from tools.scoring import web_research as web
 
 
-DEFAULT_RAW_URL_LIMIT = 120
+DEFAULT_RAW_URL_LIMIT = 100
 DEFAULT_BODY_PAGE_LIMIT = 100
 DEFAULT_QUERY_TIMEOUT = 6.0
 DEFAULT_FETCH_TIMEOUT = 6.0
@@ -29,6 +29,76 @@ DEFAULT_WORKERS = 3
 MIN_QUERY_COVERAGE = 6
 MIN_DIMENSION_COVERAGE = 3
 MAX_TOTAL_SECONDS = 300.0
+
+
+# Event order follows the research contract: a pivotal clinical readout is
+# more material than a normal company item.  These rules only classify a
+# body-verified overseas candidate; they never assert an A-share benefit.
+OVERSEAS_EVENT_RULES: tuple[dict[str, Any], ...] = (
+    {
+        "event_type": "III期/关键临床读出",
+        "priority": "P1",
+        "priority_rank": 1,
+        "terms": ("phase 3", "phase iii", "phase-3", "pivotal trial", "iii期", "3期临床"),
+        "catalyst_type": "产业催化",
+        "mapping_priority": "中",
+    },
+    {
+        "event_type": "监管审批重大节点",
+        "priority": "P2",
+        "priority_rank": 2,
+        "terms": ("fda approval", "fda approved", "breakthrough therapy", "fast track", "complete response letter", "批准上市", "突破性疗法", "快速通道"),
+        "catalyst_type": "产业催化",
+        "mapping_priority": "中",
+    },
+    {
+        "event_type": "大额并购或授权",
+        "priority": "P3",
+        "priority_rank": 3,
+        "terms": ("acquisition", "acquire", "merger", "license agreement", "licensing deal", "license-out", "并购", "授权交易", "许可协议"),
+        "catalyst_type": "产业催化",
+        "mapping_priority": "中",
+    },
+    {
+        "event_type": "订单/采购/产能落地",
+        "priority": "P4",
+        "priority_rank": 4,
+        "terms": ("purchase order", "supply agreement", "bookings", "contract award", "orders", "采购订单", "供应协议", "中标", "订单"),
+        "catalyst_type": "订单催化",
+        "mapping_priority": "高",
+    },
+    {
+        "event_type": "业绩/指引/资本开支变化",
+        "priority": "P4",
+        "priority_rank": 4,
+        "terms": ("earnings guidance", "revenue guidance", "capital expenditure", "capex", "research and development", "业绩指引", "资本开支", "研发方向"),
+        "catalyst_type": "利润催化",
+        "mapping_priority": "高",
+    },
+    {
+        "event_type": "技术路线验证或行业融资",
+        "priority": "P5",
+        "priority_rank": 5,
+        "terms": ("proof of concept", "clinical validation", "validated", "financing", "funding round", "技术验证", "临床验证", "融资"),
+        "catalyst_type": "产业催化",
+        "mapping_priority": "中",
+    },
+    {
+        "event_type": "股价异动或普通公司新闻",
+        "priority": "P6",
+        "priority_rank": 6,
+        "terms": ("shares rose", "shares fell", "stock jumped", "stock plunged", "股价大涨", "股价大跌", "暴涨", "暴跌"),
+        "catalyst_type": "情绪催化",
+        "mapping_priority": "低",
+    },
+)
+
+OVERSEAS_A_SHARE_VALIDATION = (
+    "核对A股公司F10主营、产品/业务分部与产业链位置",
+    "核对同一披露维度的收入暴露，不以概念标签代替收入",
+    "核对订单、产能利用率、收入/毛利率或现金流是否出现传导",
+    "与至少两家同行比较供给位置、壁垒和当前估值是否已交易",
+)
 
 def _compact_context(context: str) -> str:
     values: list[str] = []
@@ -60,40 +130,28 @@ def _search_backends(selected: str) -> list[str]:
     if selected == "off":
         return [selected]
     public_enabled = os.getenv("MODA_PUBLIC_SEARCH", "auto").strip().lower() not in {"0", "false", "off", "no"}
-    if selected in {"so360", "duckduckgo"}:
-        # A configured default normally chooses one fast backend.  In broad
-        # mode it is a preference, not a reason to discard the other public
-        # fallback when the first backend is sparse or blocked.
-        backends = [selected]
-        if web._secret("BRAVE_SEARCH_API_KEY"):
-            backends.append("brave")
-        if public_enabled:
-            backends.extend(item for item in ("so360", "duckduckgo") if item != selected)
-        return list(dict.fromkeys(backends))
     if selected != "auto":
         return [selected]
-    backends: list[str] = []
-    if os.getenv("SEARXNG_URL", "").strip():
-        backends.append("searxng")
+    backends: list[str] = ["duckduckgo"] if public_enabled else []
     if web._secret("BRAVE_SEARCH_API_KEY"):
         backends.append("brave")
-    if public_enabled and os.getenv("SO360_SEARCH_URL", web.SO360_SEARCH_URL).strip():
-        backends.append("so360")
-    if public_enabled:
-        backends.append("duckduckgo")
-    if os.getenv("MODA_MODEL_SEARCH_URL", "").strip() or web._secret("OPENAI_API_KEY"):
-        backends.append("model")
+    if web._secret("DEEPSEEK_API_KEY"):
+        backends.append("deepseek")
+    if web._secret("OPENAI_API_KEY"):
+        backends.append("openai")
+    if os.getenv("MODA_MODEL_SEARCH_URL", "").strip():
+        backends.append("bridge")
     return backends or ["duckduckgo"]
 
 
 def _source_priority(url: str) -> tuple[int, str, str]:
     domain = web._domain(url)
     role, tier = web._source_role(domain)
-    if role == "法定信息披露":
+    if role in {"法定信息披露", "海外监管/法定披露"}:
         return 0, role, tier
     if tier == "A":
         return 1, role, tier
-    if role in {"财经媒体", "行业研究"}:
+    if role in {"财经媒体", "行业研究", "海外行业专业"}:
         return 2, role, tier
     if role == "线索来源":
         return 4, role, tier
@@ -136,6 +194,98 @@ def _fetch_one(row: dict[str, Any], sector: str, context: str, timeout: float, d
     }
 
 
+def _classify_overseas_event(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Return an event label, never a company-benefit conclusion."""
+    if str(row.get("bucket") or "") != "海外增量雷达":
+        return None
+    if row.get("fetch_status") != "ok" or not row.get("body_scope_match"):
+        return None
+    if str(row.get("source_role") or "") == "线索来源":
+        return None
+    text = " ".join(str(row.get(key) or "") for key in ("title", "snippet", "content_excerpt")).lower()
+    for rule in OVERSEAS_EVENT_RULES:
+        if any(term.lower() in text for term in rule["terms"]):
+            return dict(rule)
+    return None
+
+
+def _build_overseas_event_radar(
+    sector: str,
+    context: str,
+    plan: list[dict[str, str]],
+    sources: list[dict[str, Any]],
+    *,
+    status: str = "completed",
+    entity_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Make the overseas-to-A-share handoff explicit and auditable.
+
+    It retains only readable, theme-matched bodies from the dedicated radar
+    queries.  A high mapping priority means *verify the earnings bridge first*,
+    not that a company has been selected or rated.
+    """
+    profile = sector_search_planner.overseas_event_profile(
+        sector,
+        context,
+        entity_context=entity_context,
+        profile_id=str(next((item.get("profile_id") for item in plan if item.get("profile_id")), "generic")),
+    )
+    radar_queries = [item for item in plan if item.get("bucket") == "海外增量雷达"]
+    selected_sources = []
+    for item in radar_queries:
+        domain = str(item.get("domain_hint") or "")
+        role, tier = web._source_role(domain)
+        selected_sources.append({"domain": domain, "source_role": role, "source_tier": tier})
+    if status == "disabled":
+        return {
+            "status": "disabled",
+            "profile": {"id": profile["id"], "label": profile["label"]},
+            "selected_sources": selected_sources,
+            "events": [],
+            "mapping_guardrails": list(OVERSEAS_A_SHARE_VALIDATION),
+            "summary": "海外增量雷达已关闭，未将空结果解释为没有海外事件。",
+        }
+
+    events: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for row in sources:
+        event = _classify_overseas_event(row)
+        url = str(row.get("url") or "")
+        if event is None or not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        events.append({
+            "event_type": event["event_type"],
+            "event_priority": event["priority"],
+            "event_priority_rank": event["priority_rank"],
+            "catalyst_type": event["catalyst_type"],
+            "a_share_mapping_priority": event["mapping_priority"],
+            "mapping_status": "待A股主营、收入暴露与订单/利润核验",
+            "mapping_chain": profile["mapping_chain"],
+            "a_share_validation": list(OVERSEAS_A_SHARE_VALIDATION),
+            "title": str(row.get("title") or ""),
+            "url": url,
+            "date": str(row.get("date") or ""),
+            "source_role": str(row.get("source_role") or ""),
+            "source_tier": str(row.get("source_tier") or ""),
+            "body_status": "正文已核验",
+        })
+    events.sort(key=lambda item: (int(item["event_priority_rank"]), item["url"]))
+    return {
+        "status": "body_verified_events" if events else "no_body_verified_event",
+        "profile": {"id": profile["id"], "label": profile["label"]},
+        "selected_sources": selected_sources,
+        "events": events[:10],
+        "mapping_guardrails": list(OVERSEAS_A_SHARE_VALIDATION),
+        "summary": (
+            f"海外增量雷达读取到 {len(events)} 条正文核验事件；"
+            "事件只提供产业链待核验映射，不构成A股受益、收入或利润事实。"
+            if events else
+            "未检出正文核验的海外增量事件；这表示本轮覆盖内未匹配，不表示海外没有事件或A股不存在受益。"
+        ),
+    }
+
+
 def _search_backend(backend: str, query: str, timeout: float, cache_scope: str) -> tuple[str, list[dict[str, Any]], list[str]]:
     """Let the paginated Brave source contribute a full wide-search page."""
     if backend == "brave":
@@ -164,12 +314,12 @@ def collect_sector_broad_evidence(
     workers: int = DEFAULT_WORKERS,
     screening: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Search 100+ candidates when available, with source and body audit data."""
+    """Search up to 100 candidates, with an auditable coverage stop."""
     theme = str(sector or "").strip()
     if not theme:
         raise ValueError("sector 不能为空")
     selected = (provider or os.getenv("MODA_SEARCH_PROVIDER", "auto")).strip().lower()
-    if selected not in {"auto", "searxng", "brave", "duckduckgo", "so360", "model", "off"}:
+    if selected not in {"auto", "brave", "duckduckgo", "deepseek", "openai", "model", "bridge", "off"}:
         selected = "off"
     entity_resolution = (
         sector_search_planner.resolve_entity_context(theme, screening=screening)
@@ -188,6 +338,9 @@ def collect_sector_broad_evidence(
     )
     plan = build_query_plan(theme, context, entity_context=entity_resolution)
     if selected == "off":
+        overseas_event_radar = _build_overseas_event_radar(
+            theme, context, plan, [], status="disabled", entity_context=entity_resolution,
+        )
         return {
             "sector": theme,
             "entity_resolution": entity_resolution,
@@ -196,6 +349,7 @@ def collect_sector_broad_evidence(
             "query_plan": plan,
             "queries": [],
             "sources": [],
+            "overseas_event_radar": overseas_event_radar,
             "audit": {"raw_result_count": 0, "raw_url_count": 0, "body_attempted": 0, "body_readable": 0, "usable_evidence_count": 0},
             "errors": [],
             "summary": "行业广搜已关闭，未将空结果解释为行业事实。",
@@ -211,6 +365,7 @@ def collect_sector_broad_evidence(
     discovered_urls: set[str] = set()
     covered_dimensions: set[str] = set()
     executed_plan_count = 0
+    early_stop_reason = ""
     web._reset_run_snapshot()
     with web._search_cache_batch():
         for item in plan:
@@ -256,7 +411,16 @@ def collect_sector_broad_evidence(
             target_reached = len(discovered_urls) >= max(0, int(raw_url_limit))
             minimum_queries_done = executed_plan_count >= min(len(plan), MIN_QUERY_COVERAGE)
             dimensions_covered = len(covered_dimensions) >= min(MIN_DIMENSION_COVERAGE, len(plan))
+            source_roles = {
+                str(row.get("source_role") or "") for row in raw_rows
+                if str(row.get("source_role") or "") not in {"", "线索来源"}
+            }
+            coverage_ready = minimum_queries_done and dimensions_covered and len(source_roles) >= 3
             if target_reached and minimum_queries_done and dimensions_covered:
+                early_stop_reason = "raw_url_target"
+                break
+            if coverage_ready:
+                early_stop_reason = "candidate_source_coverage"
                 break
 
     unique_rows, duplicate_count = _dedupe_rows(raw_rows, raw_url_limit)
@@ -293,6 +457,8 @@ def collect_sector_broad_evidence(
         "raw_url_count": len(ranked),
         "raw_url_target": max(0, int(raw_url_limit)),
         "raw_url_target_met": len(ranked) >= max(0, int(raw_url_limit)),
+        "early_stop_reason": early_stop_reason or ("query_plan_complete" if executed_plan_count == len(plan) else "budget_exhausted"),
+        "candidate_source_coverage_ready": early_stop_reason == "candidate_source_coverage",
         "body_attempted": len(body_targets),
         "body_readable": body_readable,
         "usable_evidence_count": len(usable),
@@ -302,7 +468,15 @@ def collect_sector_broad_evidence(
         "budget_used_seconds": used_seconds,
         "global_time_exhausted": time.monotonic() >= deadline,
     }
-    status = "completed" if audit["raw_url_target_met"] or executed_plan_count == len(plan) else "partial"
+    status = "completed" if audit["raw_url_target_met"] or audit["candidate_source_coverage_ready"] or executed_plan_count == len(plan) else "partial"
+    overseas_event_radar = _build_overseas_event_radar(
+        theme,
+        context,
+        plan,
+        sources,
+        status=status,
+        entity_context=entity_resolution,
+    )
     return {
         "sector": theme,
         "entity_resolution": entity_resolution,
@@ -311,6 +485,7 @@ def collect_sector_broad_evidence(
         "query_plan": plan,
         "queries": queries,
         "sources": sources,
+        "overseas_event_radar": overseas_event_radar,
         "audit": audit,
         "errors": list(dict.fromkeys(errors)),
         "summary": (

@@ -737,6 +737,27 @@ def render_logic_case(case: Mapping[str, Any]) -> str:
             )
     else:
         lines.append("候选公司待建立。")
+    broad = _mapping(_mapping(case.get("context")).get("sector_broad_research"))
+    radar = _mapping(broad.get("overseas_event_radar"))
+    if radar:
+        lines += ["", "## 海外增量到A股的映射", ""]
+        lines.append(_text(radar.get("summary")) or "海外增量雷达待执行。")
+        events = [item for item in _list(radar.get("events")) if isinstance(item, Mapping)]
+        if events:
+            lines += [
+                "",
+                "| 海外事件 | 优先级 | 催化层级 | A股映射 | 必须补的验证 |",
+                "|---|---|---|---|---|",
+            ]
+            for event in events:
+                checks = "；".join(_text(item) for item in _list(event.get("a_share_validation")) if _text(item))
+                lines.append(
+                    f"| {_text(event.get('event_type'))}：{_text(event.get('title')) or _text(event.get('url'))} | "
+                    f"{_text(event.get('event_priority'))} | {_text(event.get('catalyst_type'))} | "
+                    f"{_text(event.get('mapping_status')) or '待核验'} | {checks or 'F10、订单与利润表待核验'} |"
+                )
+        else:
+            lines.append("本轮没有可展示的正文核验事件；这不是“海外没有事件”或“没有A股受益”的结论。")
     pending_requests = [
         item
         for item in _list(case.get("evidence_requests"))

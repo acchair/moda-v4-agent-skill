@@ -151,51 +151,68 @@ class WebResearchEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(web_research.SearchBackendBlockedError, "anti_bot"):
             web_research._raise_if_search_blocked(response)
 
-    def test_so360_parser_keeps_the_direct_result_url(self) -> None:
-        html = (
-            '<li class="res-list"><h3 class="res-title"><a href="https://www.so.com/link" '
-            'data-mdurl="https://www.cninfo.com.cn/a">先导基电年报</a></h3>'
-            '<p class="res-desc">公告摘要</p></li>'
-        )
-        response = Mock(status_code=200, text=html)
+    def test_duckduckgo_lite_extracts_the_final_url(self) -> None:
+        response = Mock(status_code=200, text=(
+            '<a class="result-link" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.cninfo.com.cn%2Fa&amp;rut=x">公告</a>'
+        ))
         with patch.object(web_research, "_http_session") as session:
             session.return_value.get.return_value = response
-            rows = web_research._so360_search("先导基电", 1)
-        self.assertEqual(rows, [{
-            "title": "先导基电年报",
-            "url": "https://www.cninfo.com.cn/a",
-            "snippet": "公告摘要",
-            "date": "",
-            "engine": "360 Search",
-        }])
+            rows = web_research._duckduckgo_lite_search("测试", 1)
+        self.assertEqual(rows[0]["url"], "https://www.cninfo.com.cn/a")
 
-    def test_explicit_so360_provider_reaches_gap_collection(self) -> None:
+    def test_deepseek_parser_keeps_server_returned_url(self) -> None:
+        rows = web_research._deepseek_web_search_rows({"content": [{
+            "type": "web_search_tool_result",
+            "content": [{"title": "先导基电年报", "url": "https://www.cninfo.com.cn/a", "cited_text": "公告摘要"}],
+        }]})
+        self.assertEqual(rows[0]["url"], "https://www.cninfo.com.cn/a")
+        self.assertEqual(rows[0]["engine"], "DeepSeek Web Search")
+
+    def test_deepseek_replays_pause_turn_without_putting_the_key_in_body(self) -> None:
+        paused = Mock()
+        paused.json.return_value = {"stop_reason": "pause_turn", "content": [{"type": "text", "text": "继续"}]}
+        completed = Mock()
+        completed.json.return_value = {"stop_reason": "end_turn", "content": [{
+            "type": "web_search_tool_result",
+            "content": [{"title": "公告", "url": "https://www.cninfo.com.cn/a", "cited_text": "测试公司公告"}],
+        }]}
+        session = Mock()
+        session.post.side_effect = [paused, completed]
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "unit-test-key"}, clear=False), \
+             patch.object(web_research, "_http_session", return_value=session):
+            rows = web_research._deepseek_web_search("测试公司公告", 1)
+        self.assertEqual(rows[0]["url"], "https://www.cninfo.com.cn/a")
+        self.assertEqual(len(session.post.call_args_list), 2)
+        self.assertEqual(session.post.call_args.kwargs["json"]["tools"][0]["type"], "web_search_20250305")
+        self.assertNotIn("unit-test-key", str(session.post.call_args.kwargs["json"]))
+
+    def test_explicit_deepseek_provider_reaches_gap_collection(self) -> None:
         seen: list[str] = []
 
         def search(provider: str, query: str, timeout: float, cache_scope: str = "") -> tuple[str, list[dict], list[str]]:
             seen.append(provider)
-            return "so360", [], []
+            return "deepseek_web_search", [], []
 
         with patch.object(web_research, "_search", side_effect=search):
             result = web_research.collect(
-                "600641", "先导基电", "铋相关材料", provider="so360", timeout=0.1,
+                "600641", "先导基电", "铋相关材料", provider="deepseek", timeout=0.1,
                 targets=[_target("F4.realization")],
             )
 
         self.assertTrue(seen)
-        self.assertEqual(set(seen), {"so360"})
+        self.assertEqual(set(seen), {"deepseek"})
         self.assertEqual(len(result["web_gap_results"]), 1)
 
-    def test_empty_so360_result_names_the_actual_backend(self) -> None:
+    def test_empty_deepseek_result_names_the_actual_backend(self) -> None:
         target = _target("F1.supply_gap")
         with patch.object(web_research, "_search", return_value=("none", [], [])):
             result = web_research._collect_gap_target(
-                "600641", "先导基电", "铋相关材料", target, "so360", 1,
+                "600641", "先导基电", "铋相关材料", target, "deepseek", 1,
                 time.monotonic() + 3, 3,
             )["gap_result"]
 
         self.assertEqual(result["status"], "已搜索未命中")
-        self.assertEqual(result["reason"], "360搜索未返回相关结果")
+        self.assertEqual(result["reason"], "DeepSeek Web Search未返回相关结果")
 
     def test_industry_web_signal_uses_the_configured_provider_when_empty(self) -> None:
         from tools.akshare import industry_prosperity
@@ -206,12 +223,17 @@ class WebResearchEvidenceTest(unittest.TestCase):
             providers.append(provider)
             return "none", [], []
 
-        with patch.dict(os.environ, {"MODA_SEARCH_PROVIDER": "so360"}, clear=False), \
+        with patch.dict(os.environ, {"MODA_SEARCH_PROVIDER": "deepseek"}, clear=False), \
              patch.object(web_research, "_search", side_effect=search):
             result = industry_prosperity.collect_web_signal("先导基电", "半导体材料", timeout=0.1)
 
-        self.assertEqual(set(providers), {"so360"})
-        self.assertEqual(result["provider"], "so360")
+        self.assertEqual(set(providers), {"deepseek"})
+        self.assertEqual(result["provider"], "deepseek")
+
+    def test_overseas_radar_domains_keep_regulatory_media_and_specialist_roles_distinct(self) -> None:
+        self.assertEqual(web_research._source_role("fda.gov"), ("海外监管/法定披露", "A"))
+        self.assertEqual(web_research._source_role("reuters.com"), ("财经媒体", "B"))
+        self.assertEqual(web_research._source_role("semianalysis.com"), ("海外行业专业", "B"))
 
     def test_public_pdf_fetch_for_annual_report_forwards_caller_limits(self) -> None:
         response = Mock()
@@ -366,7 +388,8 @@ class WebResearchEvidenceTest(unittest.TestCase):
             "url": "https://www.gov.cn/liquid-cooling",
             "snippet": "液冷需求增长、订单增加、产能利用率提升。",
         }
-        with patch.object(web_research, "MAX_SECTOR_WORKERS", 1), \
+        with patch.dict(os.environ, {"MODA_SEARCH_PROVIDER": "auto"}, clear=False), \
+             patch.object(web_research, "MAX_SECTOR_WORKERS", 1), \
              patch.object(web_research, "MAX_SECTOR_QUERIES_PER_SECTION", 1), \
              patch.object(web_research, "_search", return_value=("test", [row], [])), \
              patch.object(web_research, "_fetch_page", return_value=("timeout", "")):
@@ -400,7 +423,8 @@ class WebResearchEvidenceTest(unittest.TestCase):
                 return "ok", "液冷需求增长，技术路线正在演进。"
             return "ok", "液冷产业需求增长，技术路线持续演进。"
 
-        with patch.object(web_research, "MAX_SECTOR_WORKERS", 1), \
+        with patch.dict(os.environ, {"MODA_SEARCH_PROVIDER": "auto"}, clear=False), \
+             patch.object(web_research, "MAX_SECTOR_WORKERS", 1), \
              patch.object(web_research, "_search", side_effect=search), \
              patch.object(web_research, "_fetch_page", side_effect=fetch):
             result = web_research.collect_sector_evidence("液冷", timeout=1)

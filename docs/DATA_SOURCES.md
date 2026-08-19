@@ -25,7 +25,7 @@
 | L | 本地静态名单、缓存、历史报告 | 提高覆盖和运行效率 | 代替实时官方名单或新鲜市场数据 |
 | T | 健康检查、缓存、限流、清洗等工具 | 诊断、保护和质量控制 | 产出选股证据 |
 
-搜索后端本身不决定证据等级：360、DuckDuckGo、SearXNG、模型搜索返回的链接，仍按目标网页所属的 A/B/C 来源判定。
+搜索后端本身不决定证据等级：DuckDuckGo Lite、DeepSeek、OpenAI、模型搜索返回的链接，仍按目标网页所属的 A/B/C 来源判定。
 
 ### 1.2 全局返回状态
 
@@ -264,11 +264,12 @@
 | <code>stock_discussion.collect</code> | 雪球/股吧帖子、作者、互动、情绪、样本状态 | 雪球搜索接口 + 东财股吧（经统一节流）→ 搜索栈 | 双源且至少 10 条才充分；单源/少样本降级；搜索只作未核验线索 |
 | <code>news_sentiment.collect</code> | 与公司别名匹配的财经快讯和词典情绪 | 金十、东财快讯（经统一节流）、同花顺快讯 | 三源并发、10 分钟缓存；只作舆情辅助 |
 | <code>social_sentiment._collect_news</code> | 结构化快讯为空时的公司新闻候选 URL | <code>news_sentiment.collect</code> → 搜索栈补缺 | 搜索候选明确标“未核验”，不改变结构化新闻情绪/计数，也不直接计分 |
-| <code>web_research.collect</code> | F1–F5 缺口的查询词、URL、正文、来源角色和核验结果 | SearXNG → 360 → DuckDuckGo MCP → DuckDuckGo HTML → DuckDuckGo Lite → 带引用模型搜索 | 对全部未解决 F1–F5 先做首轮；单目标最多 3 个查询、75 秒总预算；F6 不走网页补分 |
+| <code>web_research.collect</code> | F1–F5 缺口的查询词、URL、正文、来源角色和核验结果 | DuckDuckGo Lite → DeepSeek Web Search → OpenAI Web Search → 带引用模型搜索 | 对全部未解决 F1–F5 先做首轮；单目标最多 3 个查询、75 秒总预算；F6 不走网页补分 |
 | <code>web_research.collect_sector_evidence</code> | 行业趋势、供需、利润池、稀缺环节、利润兑现、市场定价六断面 | 同一搜索栈；有板块轻筛结果时复用 AKShare 板块实体与 F10 主营 | 45 秒总预算；只产出可追溯证据状态 |
-| <code>sector_broad_research.collect_sector_broad_evidence</code> | 板块实体解析、动态查询计划、宽搜 URL 库、正文与计数审计 | 先复用 AKShare/东财行业或概念成分股与 F10 主营，再走 SearXNG / 可选 Brave 分页搜索 → 360 / DuckDuckGo / 带引用模型搜索 | 目标 120 个去重 URL、读取前 100 个正文；查询数随板块实体和业务类型变化，不再固定套用某一产业的一手域名；只形成待核验材料，不作板块结论 |
-| <code>search_stack.check_stack</code> | 搜索后端配置和可用性 | 本地/公共探针 | T 级诊断，不产出研究证据 |
-| <code>search_stack.start_ddg_mcp</code> | 启动本地 DuckDuckGo MCP 服务 | 本地服务 | 运行工具，不是搜索结果 |
+| <code>sector_broad_research.collect_sector_broad_evidence</code> | 板块实体解析、动态查询计划、宽搜 URL 库、正文与计数审计 | 先复用 AKShare/东财行业或概念成分股与 F10 主营，再走 DuckDuckGo Lite / 可选 Brave → DeepSeek / OpenAI Web Search | 默认最多 100 个去重 URL、读取前 100 个正文；达到多类候选来源覆盖可提前结束；只形成待核验材料，不作板块结论 |
+| <code>sector_search_planner.OVERSEAS_INTELLIGENCE_SOURCE_CATALOG</code> + <code>overseas_event_radar</code> | 海外隔夜增量扫描、事件分级与“海外事件→A股待核验链” | 按板块仅选择 4 个监管/一手/专业/财经站点，再由同一搜索栈取得 URL 和正文 | 不是逐站数据接口或全站扫描；只有正文匹配的事件才展示，且不得直接写成 A股受益、订单或利润事实 |
+| <code>sector_screening.collect_sector_market_snapshot</code> | 板块现价、60 日区间、资金流、成分股涨跌广度、领涨领跌、TDX 板块排行 | AKShare/东方财富 + efinance 批量行情 + easy-tdx | 市场状态层；聚合源不作为独立交叉验证，不参与公司排序或五态 |
+| <code>search_stack.check_stack</code> | DuckDuckGo Lite 和联网模型配置可用性 | 公共探针 / 仅配置检查 | T 级诊断，不产出研究证据 |
 
 ### 7.1 网页搜索的硬门槛
 
@@ -280,6 +281,27 @@
 - 实体解析后动态拆成“定义边界、市场规模、产业链、技术路线、供需、竞争/国产化、利润池、公司兑现、市场定价、反证”查询；再按主营关键词选择软件、材料、设备、医药、消费或通用业务模型的指标。陌生板块走同一通用拆分，不默认套用英伟达、高通等固定公司域名。
 - 板块广搜按“板块专属权威来源、实体校准、政策统计、法定披露、技术标准、市场事实、补充媒体”排队；论坛、社交和搜索摘要不占确认优先级。即使开放查询先凑够 URL 数，也必须完成最低查询数和至少三个研究维度后才能提前停止。广搜报告必须同时展示 AKShare 实体解析结果、查询维度覆盖、原始结果数、去重 URL、正文尝试/可读数和可用证据数。
 - 若需要稳定完成 100+ URL 的广搜，应配置 <code>BRAVE_SEARCH_API_KEY</code>（分页搜索，密钥只放本机环境）；未配置时系统仅用公开后端，并保留“目标未达”的真实计数，不应把 15 条等稀疏结果说成 100 条。
+
+### 7.1.1 海外增量到 A 股的固定手法
+
+- 板块/概念完成本地实体解析后，先执行一个按行业选源的“海外增量雷达”，再进入行业结构和 A 股公司兑现检索。它扫描的不是普通海外新闻，而是 III 期/关键临床读出、监管审批、并购授权、订单采购、业绩指引/资本开支、技术验证/融资及股价异动原因。
+- 事件优先级固定为：III 期/关键临床读出（P1）→ 监管审批重大节点（P2）→ 大额并购或授权（P3）→ 订单、业绩或资本开支（P4）→ 技术验证或融资（P5）→ 股价异动/普通新闻（P6）。这只是海外事件的研究优先级，不是 A 股交易优先级。
+- 每条正文核验事件必须标为：情绪催化、产业催化、订单催化或利润催化。订单/利润催化只获得“优先验证 A 股业绩桥”的资格；仍需 F10 同维度收入暴露、订单/产能、收入/毛利/现金流和同行比较，才可进入候选排序或深研。
+- 输出的因果链只能写成“海外事件 → 改变的产业变量 → 待核验的 A 股供给环节”。禁止由“美股公司上涨”跳到“中国版公司受益”，也禁止把概念名称、搜索标题或同源转载写成收入和利润。
+
+### 7.1.2 全球情报源库（按需选择，不全量扫站）
+
+| 场景 | 优先监管/一手层 | 行业/财经发现层 |
+|---|---|---|
+| 宏观金融 | Federal Reserve、FRED、BEA、BLS | Reuters、Bloomberg、FT、WSJ、CNBC、Nikkei |
+| 生命科学 | FDA、ClinicalTrials.gov、SEC | Fierce Biotech、Endpoints、BioPharma Dive、Reuters |
+| 半导体/AI | SEC、公司 IR/财报 | TrendForce、SemiAnalysis、Digitimes、Reuters |
+| 能源/金属/化工 | EIA、SEC | S&P Global、Argus、Fastmarkets、Reuters |
+| 军工航天 | U.S. DoD、SEC | Defense News、Breaking Defense、Reuters |
+| 航运物流 | MARAD、SEC | Lloyd's List、Splash247、Reuters |
+| 农业食品 | USDA、FAO、SEC | Agricensus、Reuters |
+
+目录只登记发现入口；付费墙、无法读取正文、对象不匹配或只是搜索摘要，都要在审计中保留为覆盖/候选状态，不能补成事实。
 
 ### 7.2 板块专属来源不是自动事实
 
